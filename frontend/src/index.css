@@ -1,0 +1,99 @@
+@import "tailwindcss";
+
+/* ── Theme color variables ──────────────────────────────── */
+
+:root {
+  /* Default: dark theme */
+  --color-bg-body: #0f172a;
+  --color-bg-surface: #1e293b;
+  --color-bg-elevated: #334155;
+  --color-bg-hover: rgba(51, 65, 85, 0.3);
+  --color-bg-inset: rgba(15, 23, 42, 0.5);
+  --color-bg-deep: #0f172a;
+
+  --color-text-heading: #ffffff;
+  --color-text-primary: #e2e8f0;
+  --color-text-secondary: #94a3b8;
+  --color-text-tertiary: #cbd5e1;
+  --color-text-muted: #64748b;
+
+  --color-border-default: #475569;
+  --color-border-subtle: #334155;
+  --color-border-row: rgba(51, 65, 85, 0.5);
+
+  --color-ring-default: #475569;
+
+  /* Chart colors */
+  --color-chart-grid: #334155;
+  --color-chart-axis: #64748b;
+  --color-chart-ref: #475569;
+  --color-chart-tooltip-bg: #1e293b;
+  --color-chart-tooltip-border: #334155;
+  --color-chart-label: #94a3b8;
+}
+
+[data-theme="light"] {
+  --color-bg-body: #f8fafc;
+  --color-bg-surface: #ffffff;
+  --color-bg-elevated: #f1f5f9;
+  --color-bg-hover: rgba(241, 245, 249, 0.5);
+  --color-bg-inset: #f1f5f9;
+  --color-bg-deep: #e2e8f0;
+
+  --color-text-heading: #0f172a;
+  --color-text-primary: #1e293b;
+  --color-text-secondary: #64748b;
+  --color-text-tertiary: #334155;
+  --color-text-muted: #94a3b8;
+
+  --color-border-default: #cbd5e1;
+  --color-border-subtle: #e2e8f0;
+  --color-border-row: rgba(226, 232, 240, 0.5);
+
+  --color-ring-default: #cbd5e1;
+
+  --color-chart-grid: #e2e8f0;
+  --color-chart-axis: #94a3b8;
+  --color-chart-ref: #cbd5e1;
+  --color-chart-tooltip-bg: #ffffff;
+  --color-chart-tooltip-border: #e2e8f0;
+  --color-chart-label: #64748b;
+}
+
+/* ── Register as Tailwind theme tokens ─────────────────── */
+
+@theme {
+  --color-surface: var(--color-bg-surface);
+  --color-elevated: var(--color-bg-elevated);
+  --color-hover: var(--color-bg-hover);
+  --color-inset: var(--color-bg-inset);
+  --color-deep: var(--color-bg-deep);
+
+  --color-heading: var(--color-text-heading);
+  --color-primary: var(--color-text-primary);
+  --color-secondary: var(--color-text-secondary);
+  --color-tertiary: var(--color-text-tertiary);
+  --color-muted: var(--color-text-muted);
+
+  --color-border-default: var(--color-border-default);
+  --color-border-subtle: var(--color-border-subtle);
+  --color-border-row: var(--color-border-row);
+
+  --color-ring-default: var(--color-ring-default);
+}
+
+/* ── Base styles ──────────────────────────────────────── */
+
+body {
+  margin: 0;
+  background-color: var(--color-bg-body);
+  color: var(--color-text-primary);
+  font-family: Inter, system-ui, -apple-system, sans-serif;
+}
+
+/* Smooth transition on theme switch */
+*,
+*::before,
+*::after {
+  transition: background-color 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+}

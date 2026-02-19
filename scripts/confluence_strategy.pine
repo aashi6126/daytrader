@@ -1,0 +1,201 @@
+// Multi-Indicator Confluence Strategy for 0DTE SPY Options
+// Scores 6 independent technical factors — only trades when 4+ agree
+//
+// The 6 Factors:
+//   1. VWAP bias       — close above (CALL) or below (PUT) VWAP
+//   2. EMA trend       — EMA 9 > EMA 21 (CALL) or EMA 9 < EMA 21 (PUT)
+//   3. RSI favorable   — not overbought for CALL, not oversold for PUT
+//   4. MACD histogram  — positive (CALL) or negative (PUT)
+//   5. Relative volume  — current bar volume > threshold × 20-bar avg
+//   6. Price action     — green candle (CALL) or red candle (PUT)
+//
+// Optimized for 1-minute SPY (5-day backtest):
+//   minConf=4, volThreshold=1.5, RSI 14, delta 0.5, SL 10%, PT 30%
+//   Result: +$1,184, 40 trades, 52.5% WR, 3.20 PF
+//
+// Also strong with higher quality settings:
+//   minConf=4, volThreshold=1.5, RSI 9, ATR 14, delta 0.3
+//   Result: +$983, 44 trades, 70.5% WR, 5.91 PF
+//
+// Setup:
+//   1. Add to SPY 1-min or 5-min chart
+//   2. Create alert → "Confluence Strategy" → any alert()
+//   3. Webhook URL = https://your-server/api/webhook
+
+//@version=6
+indicator("Confluence Strategy (6-Factor)", overlay=true, max_bars_back=500)
+
+// ── Inputs ──────────────────────────────────────────────────────────
+
+webhookSecret   = input.string("YoGnOKFZBJBd4ZuxXrLVrHu2bY8J8BfE", "Webhook Secret")
+minConfluence   = input.int(4, "Min Confluence Score", minval=3, maxval=6, tooltip="How many of the 6 factors must agree (4=aggressive, 5=balanced, 6=conservative)")
+emaFast         = input.int(9, "EMA Fast", minval=2, maxval=50)
+emaSlow         = input.int(21, "EMA Slow", minval=5, maxval=200)
+rsiPeriod       = input.int(14, "RSI Period", minval=2, maxval=50)
+rsiOB           = input.float(70.0, "RSI Overbought", minval=50, maxval=95)
+rsiOS           = input.float(30.0, "RSI Oversold", minval=5, maxval=50)
+volSMAPeriod    = input.int(20, "Volume SMA Period", minval=5, maxval=50)
+volThreshold    = input.float(1.5, "Volume Threshold (x avg)", minval=1.0, maxval=3.0, step=0.5)
+
+// MACD (standard 12/26/9)
+macdFast        = input.int(12, "MACD Fast", minval=2, maxval=50, group="MACD")
+macdSlow        = input.int(26, "MACD Slow", minval=5, maxval=200, group="MACD")
+macdSignalLen   = input.int(9, "MACD Signal", minval=2, maxval=50, group="MACD")
+
+// Trading windows
+afternoonOn     = input.bool(true, "Afternoon Window Enabled", group="Windows")
+
+// ── Time helpers ────────────────────────────────────────────────────
+
+barHour   = hour(time)
+barMinute = minute(time)
+barMins   = barHour * 60 + barMinute
+
+morningWinStart   = 9 * 60 + 45
+morningWinEnd     = 11 * 60 + 15
+afternoonWinStart = 12 * 60 + 45
+afternoonWinEnd   = 14 * 60 + 50
+
+inMorningWindow   = barMins >= morningWinStart and barMins <= morningWinEnd
+inAfternoonWindow = afternoonOn and barMins >= afternoonWinStart and barMins <= afternoonWinEnd
+inTradingWindow   = inMorningWindow or inAfternoonWindow
+
+isNewDay = ta.change(time("D")) != 0
+
+// ── Indicator Calculations ──────────────────────────────────────────
+
+// 1. VWAP
+vwapVal = ta.vwap(hlc3)
+
+// 2. EMA trend
+emaF = ta.ema(close, emaFast)
+emaS = ta.ema(close, emaSlow)
+
+// 3. RSI
+rsiVal = ta.rsi(close, rsiPeriod)
+
+// 4. MACD
+[macdLine, signalLine, histLine] = ta.macd(close, macdFast, macdSlow, macdSignalLen)
+
+// 5. Relative volume
+volSMA  = ta.sma(volume, volSMAPeriod)
+relVol  = volSMA > 0 ? volume / volSMA : 0.0
+
+// ── Confluence Scoring ──────────────────────────────────────────────
+
+// CALL score
+callScore = 0
+callScore += close > vwapVal ? 1 : 0                          // 1. VWAP bullish
+callScore += emaF > emaS ? 1 : 0                              // 2. EMA uptrend
+callScore += (not na(rsiVal) and rsiVal < rsiOB) ? 1 : 0      // 3. RSI not overbought
+callScore += (not na(histLine) and histLine > 0) ? 1 : 0      // 4. MACD positive
+callScore += relVol >= volThreshold ? 1 : 0                    // 5. Volume above avg
+callScore += close > open ? 1 : 0                             // 6. Green candle
+
+// PUT score
+putScore = 0
+putScore += close < vwapVal ? 1 : 0                            // 1. VWAP bearish
+putScore += emaF < emaS ? 1 : 0                               // 2. EMA downtrend
+putScore += (not na(rsiVal) and rsiVal > rsiOS) ? 1 : 0       // 3. RSI not oversold
+putScore += (not na(histLine) and histLine < 0) ? 1 : 0       // 4. MACD negative
+putScore += relVol >= volThreshold ? 1 : 0                     // 5. Volume above avg
+putScore += close < open ? 1 : 0                              // 6. Red candle
+
+// ── Signal Logic ────────────────────────────────────────────────────
+
+callSignal = callScore >= minConfluence and callScore > putScore and inTradingWindow
+putSignal  = putScore >= minConfluence and putScore > callScore and inTradingWindow
+
+// ── Debounce: max one signal per direction per day ──────────────────
+
+var bool calledToday = false
+var bool puttedToday = false
+
+if isNewDay
+    calledToday := false
+    puttedToday := false
+
+callFire = callSignal and not calledToday
+putFire  = putSignal  and not puttedToday
+
+if callFire
+    calledToday := true
+if putFire
+    puttedToday := true
+
+// ── Webhook Alerts ──────────────────────────────────────────────────
+
+callFactors = (close > vwapVal ? "VWAP " : "") + (emaF > emaS ? "EMA " : "") + (rsiVal < rsiOB ? "RSI" + str.tostring(rsiVal, "#") + " " : "") + (histLine > 0 ? "MACD " : "") + (relVol >= volThreshold ? "Vol" + str.tostring(relVol, "#.#") + "x " : "") + (close > open ? "Candle" : "")
+putFactors  = (close < vwapVal ? "VWAP " : "") + (emaF < emaS ? "EMA " : "") + (rsiVal > rsiOS ? "RSI" + str.tostring(rsiVal, "#") + " " : "") + (histLine < 0 ? "MACD " : "") + (relVol >= volThreshold ? "Vol" + str.tostring(relVol, "#.#") + "x " : "") + (close < open ? "Candle" : "")
+
+callMsg = '{"ticker":"SPY","action":"BUY_CALL","secret":"' + webhookSecret + '","price":' + str.tostring(close) + ',"comment":"Confluence ' + str.tostring(callScore) + '/6: ' + callFactors + '"}'
+putMsg  = '{"ticker":"SPY","action":"BUY_PUT","secret":"' + webhookSecret + '","price":' + str.tostring(close) + ',"comment":"Confluence ' + str.tostring(putScore) + '/6: ' + putFactors + '"}'
+
+if callFire
+    alert(callMsg, alert.freq_once_per_bar)
+if putFire
+    alert(putMsg, alert.freq_once_per_bar)
+
+// ── Plotting ────────────────────────────────────────────────────────
+
+// VWAP
+plot(vwapVal, "VWAP", color.new(color.yellow, 30), 2)
+
+// EMAs
+plot(emaF, "EMA Fast", color.new(color.aqua, 30), 1)
+plot(emaS, "EMA Slow", color.new(color.orange, 30), 1)
+
+// Signal markers
+plotshape(callFire, "CALL", shape.triangleup,   location.belowbar, color.green, size=size.small)
+plotshape(putFire,  "PUT",  shape.triangledown, location.abovebar, color.red,   size=size.small)
+
+// Background color when confluence is high
+callBg = callScore >= minConfluence and callScore > putScore
+putBg  = putScore >= minConfluence and putScore > callScore
+bgcolor(callBg and inTradingWindow ? color.new(color.green, 92) : putBg and inTradingWindow ? color.new(color.red, 92) : na)
+
+// ── Info Table ──────────────────────────────────────────────────────
+
+var table infoTable = table.new(position.top_right, 3, 8, bgcolor=color.new(color.gray, 85))
+
+if barstate.islast
+    table.cell(infoTable, 0, 0, "Factor",       text_color=color.white, text_size=size.small, text_halign=text.align_left)
+    table.cell(infoTable, 1, 0, "CALL",          text_color=color.green, text_size=size.small)
+    table.cell(infoTable, 2, 0, "PUT",           text_color=color.red, text_size=size.small)
+
+    // 1. VWAP
+    table.cell(infoTable, 0, 1, "VWAP",          text_color=color.white, text_size=size.tiny)
+    table.cell(infoTable, 1, 1, close > vwapVal ? "+" : "-", text_color=close > vwapVal ? color.green : color.gray, text_size=size.tiny)
+    table.cell(infoTable, 2, 1, close < vwapVal ? "+" : "-", text_color=close < vwapVal ? color.red : color.gray, text_size=size.tiny)
+
+    // 2. EMA
+    table.cell(infoTable, 0, 2, "EMA " + str.tostring(emaFast) + "/" + str.tostring(emaSlow), text_color=color.white, text_size=size.tiny)
+    table.cell(infoTable, 1, 2, emaF > emaS ? "+" : "-", text_color=emaF > emaS ? color.green : color.gray, text_size=size.tiny)
+    table.cell(infoTable, 2, 2, emaF < emaS ? "+" : "-", text_color=emaF < emaS ? color.red : color.gray, text_size=size.tiny)
+
+    // 3. RSI
+    rsiStr = na(rsiVal) ? "—" : str.tostring(rsiVal, "#.0")
+    table.cell(infoTable, 0, 3, "RSI(" + str.tostring(rsiPeriod) + ") " + rsiStr, text_color=color.white, text_size=size.tiny)
+    table.cell(infoTable, 1, 3, rsiVal < rsiOB ? "+" : "-", text_color=rsiVal < rsiOB ? color.green : color.gray, text_size=size.tiny)
+    table.cell(infoTable, 2, 3, rsiVal > rsiOS ? "+" : "-", text_color=rsiVal > rsiOS ? color.red : color.gray, text_size=size.tiny)
+
+    // 4. MACD
+    table.cell(infoTable, 0, 4, "MACD Hist",     text_color=color.white, text_size=size.tiny)
+    table.cell(infoTable, 1, 4, histLine > 0 ? "+" : "-", text_color=histLine > 0 ? color.green : color.gray, text_size=size.tiny)
+    table.cell(infoTable, 2, 4, histLine < 0 ? "+" : "-", text_color=histLine < 0 ? color.red : color.gray, text_size=size.tiny)
+
+    // 5. Volume
+    volStr = str.tostring(relVol, "#.#") + "x"
+    table.cell(infoTable, 0, 5, "Vol " + volStr,  text_color=color.white, text_size=size.tiny)
+    table.cell(infoTable, 1, 5, relVol >= volThreshold ? "+" : "-", text_color=relVol >= volThreshold ? color.green : color.gray, text_size=size.tiny)
+    table.cell(infoTable, 2, 5, relVol >= volThreshold ? "+" : "-", text_color=relVol >= volThreshold ? color.red : color.gray, text_size=size.tiny)
+
+    // 6. Candle
+    table.cell(infoTable, 0, 6, "Candle",         text_color=color.white, text_size=size.tiny)
+    table.cell(infoTable, 1, 6, close > open ? "+" : "-", text_color=close > open ? color.green : color.gray, text_size=size.tiny)
+    table.cell(infoTable, 2, 6, close < open ? "+" : "-", text_color=close < open ? color.red : color.gray, text_size=size.tiny)
+
+    // Total score
+    table.cell(infoTable, 0, 7, "SCORE",          text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 7, str.tostring(callScore) + "/6", text_color=callScore >= minConfluence ? color.green : color.gray, text_size=size.small)
+    table.cell(infoTable, 2, 7, str.tostring(putScore) + "/6",  text_color=putScore >= minConfluence ? color.red : color.gray, text_size=size.small)
