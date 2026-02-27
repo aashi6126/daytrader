@@ -71,11 +71,11 @@ class Settings(BaseSettings):
     TRAILING_STOP_AFTER_SCALE_OUT_PERCENT: float = 10.0
     MAX_HOLD_MINUTES: int = 90
     FORCE_EXIT_HOUR: int = 15
-    FORCE_EXIT_MINUTE: int = 30
+    FORCE_EXIT_MINUTE: int = 0
     FIRST_ENTRY_HOUR: int = 10
     FIRST_ENTRY_MINUTE: int = 0
     LAST_ENTRY_HOUR: int = 14
-    LAST_ENTRY_MINUTE: int = 45
+    LAST_ENTRY_MINUTE: int = 15
     AFTERNOON_WINDOW_ENABLED: bool = True
     SCALE_OUT_ENABLED: bool = True
     BREAKEVEN_TRIGGER_PERCENT: float = 10.0

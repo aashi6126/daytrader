@@ -169,7 +169,7 @@ async def test_force_exit_330pm(db_session, mock_schwab, ws_manager):
     mock_schwab.set_quote("SPY_TEST_OPT", bid=2.05, ask=2.15)
 
     engine = _make_exit_engine(mock_schwab, ws_manager)
-    now = datetime(2026, 2, 7, 15, 31, tzinfo=ET)  # 3:31 PM ET
+    now = datetime(2026, 2, 7, 15, 1, tzinfo=ET)  # 3:01 PM ET
     result = await engine.evaluate_position(db_session, trade, now_et=now)
 
     assert result == ExitReason.TIME_BASED
@@ -184,7 +184,7 @@ async def test_no_exit_before_330pm(db_session, mock_schwab, ws_manager):
     mock_schwab.set_quote("SPY_TEST_OPT", bid=2.05, ask=2.15)
 
     engine = _make_exit_engine(mock_schwab, ws_manager)
-    now = datetime(2026, 2, 7, 15, 29, tzinfo=ET)  # 3:29 PM ET
+    now = datetime(2026, 2, 7, 14, 59, tzinfo=ET)  # 2:59 PM ET
     result = await engine.evaluate_position(db_session, trade, now_et=now)
 
     assert result is None
