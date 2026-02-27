@@ -39,6 +39,8 @@ class Settings(BaseSettings):
     DEDUP_WINDOW_SECONDS: int = 30
     MIN_PRICE_RANGE: float = 0.50
     MAX_CONSECUTIVE_LOSSES: int = 3
+    # VIX circuit breaker — block all new trades when VIX >= this
+    VIX_CIRCUIT_BREAKER: float = 28.0
 
     # Entry limit strategy
     ENTRY_LIMIT_BELOW_PERCENT: float = 5.0

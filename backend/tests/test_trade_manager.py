@@ -1,4 +1,6 @@
-from datetime import date
+from datetime import date, datetime
+from unittest.mock import MagicMock, patch
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -144,3 +146,35 @@ async def test_process_alert_put_signal(db_session, trade_manager_deps):
     assert result.status == "accepted"
     trade = db_session.query(Trade).filter(Trade.id == result.trade_id).first()
     assert trade.direction == TradeDirection.PUT
+
+
+@pytest.mark.asyncio
+async def test_vix_circuit_breaker_rejects_trade(db_session, trade_manager_deps):
+    """Trades should be rejected when VIX >= circuit breaker threshold."""
+    alert = TradingViewAlert(
+        ticker="SPY", action="BUY_CALL", secret="test-secret", price=600.0,
+    )
+    db_alert = Alert(
+        raw_payload="{}", ticker="SPY", direction=TradeDirection.CALL,
+        signal_price=600.0, status=AlertStatus.RECEIVED,
+    )
+    db_session.add(db_alert)
+    db_session.flush()
+
+    # Mock VIX to be above circuit breaker
+    mock_streaming = MagicMock()
+    mock_vix_snap = MagicMock()
+    mock_vix_snap.is_stale = False
+    mock_vix_snap.last = 32.0
+    mock_streaming.get_equity_quote.return_value = mock_vix_snap
+
+    # Mock time to be within market hours (11:00 AM ET)
+    mock_now = datetime(2026, 3, 2, 11, 0, tzinfo=ZoneInfo("America/New_York"))
+    with patch("app.services.trade_manager.datetime") as mock_dt, \
+         patch("app.dependencies.get_streaming_service", return_value=mock_streaming):
+        mock_dt.now.return_value = mock_now
+        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+        result = await trade_manager_deps.process_alert(db_session, db_alert, alert)
+
+    assert result.status == "rejected"
+    assert "VIX circuit breaker" in result.message
