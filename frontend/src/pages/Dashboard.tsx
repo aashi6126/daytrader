@@ -330,13 +330,6 @@ export default function Dashboard() {
         </div>
       </div>
 
-      {/* Strategy cards */}
-      <StrategyCards
-        strategies={enabledStrategies}
-        selectedTicker={selectedTicker}
-        onSelect={setSelectedTicker}
-      />
-
       {/* Daily stats bar */}
       <DailyStats stats={stats} />
 
