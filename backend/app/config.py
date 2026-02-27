@@ -79,6 +79,8 @@ class Settings(BaseSettings):
     LAST_ENTRY_HOUR: int = 14
     LAST_ENTRY_MINUTE: int = 15
     AFTERNOON_WINDOW_ENABLED: bool = True
+    # Event calendar: block afternoon trades on FOMC/CPI days
+    EVENT_CALENDAR_PATH: str = "data/event_calendar.json"
     SCALE_OUT_ENABLED: bool = True
     BREAKEVEN_TRIGGER_PERCENT: float = 10.0
     SCALE_OUT_TIER_1_PERCENT: float = 20.0

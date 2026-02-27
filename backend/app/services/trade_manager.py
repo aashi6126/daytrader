@@ -43,6 +43,29 @@ class TradeManager:
             return self.app.state.use_market_orders
         return False
 
+    @staticmethod
+    def _is_event_afternoon_blocked() -> tuple[bool, str]:
+        """Check if today is a blocked afternoon (FOMC/CPI day).
+
+        Returns (is_blocked, event_description).
+        """
+        import json
+        from pathlib import Path
+
+        cal_path = Path(__file__).resolve().parent.parent / settings.EVENT_CALENDAR_PATH
+        if not cal_path.exists():
+            return False, ""
+
+        try:
+            data = json.loads(cal_path.read_text())
+            blocked = data.get("blocked_afternoons", [])
+            today_str = date.today().isoformat()
+            if today_str in blocked:
+                return True, f"Event day ({today_str})"
+        except Exception as e:
+            logger.warning(f"Event calendar read failed: {e}")
+        return False, ""
+
     def get_daily_trade_count(self, db: Session) -> int:
         today = date.today()
         count = (
@@ -314,6 +337,20 @@ class TradeManager:
                     )
             except Exception as e:
                 logger.warning(f"VIX circuit breaker check failed (allowing trade): {e}")
+
+        # 0c. Event calendar: block afternoon trades on FOMC/CPI days
+        afternoon_cutoff = time(12, 0)  # noon ET
+        if now_et.time() >= afternoon_cutoff:
+            is_blocked, event_desc = self._is_event_afternoon_blocked()
+            if is_blocked:
+                db_alert.status = AlertStatus.REJECTED
+                db_alert.rejection_reason = f"Afternoon blocked: {event_desc}"
+                db.commit()
+                logger.info(f"Trade rejected: afternoon blocked — {event_desc}")
+                return WebhookResponse(
+                    status="rejected",
+                    message=f"Afternoon trading blocked: {event_desc}",
+                )
 
         # 1. Check daily trade count limit
         trade_count = self.get_daily_trade_count(db)

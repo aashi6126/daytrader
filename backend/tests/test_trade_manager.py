@@ -178,3 +178,34 @@ async def test_vix_circuit_breaker_rejects_trade(db_session, trade_manager_deps)
 
     assert result.status == "rejected"
     assert "VIX circuit breaker" in result.message
+
+
+@pytest.mark.asyncio
+async def test_event_calendar_blocks_afternoon_trades(db_session, trade_manager_deps):
+    """Afternoon trades should be blocked on FOMC/CPI days."""
+    alert = TradingViewAlert(
+        ticker="SPY", action="BUY_CALL", secret="test-secret", price=600.0,
+    )
+    db_alert = Alert(
+        raw_payload="{}", ticker="SPY", direction=TradeDirection.CALL,
+        signal_price=600.0, status=AlertStatus.RECEIVED,
+    )
+    db_session.add(db_alert)
+    db_session.flush()
+
+    # Mock: current time is 1:00 PM ET, and today is a blocked day
+    mock_now = datetime(2026, 3, 18, 13, 0, tzinfo=ZoneInfo("America/New_York"))
+    with patch("app.services.trade_manager.datetime") as mock_dt, \
+         patch.object(TradeManager, "_is_event_afternoon_blocked", return_value=(True, "Event day (2026-03-18)")):
+        mock_dt.now.return_value = mock_now
+        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+        # Also need to mock VIX check to not interfere
+        with patch("app.dependencies.get_streaming_service") as mock_stream:
+            mock_snap = MagicMock()
+            mock_snap.is_stale = False
+            mock_snap.last = 18.0  # low VIX, should pass
+            mock_stream.return_value.get_equity_quote.return_value = mock_snap
+            result = await trade_manager_deps.process_alert(db_session, db_alert, alert)
+
+    assert result.status == "rejected"
+    assert "Afternoon trading blocked" in result.message
