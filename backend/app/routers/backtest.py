@@ -48,11 +48,11 @@ class BacktestRequest(BaseModel):
     quantity: int = Field(2, ge=1, le=10)
     delta_target: float = Field(0.4, ge=0.1, le=0.9)
 
-    stop_loss_percent: float = Field(16.0, ge=1, le=50)
-    profit_target_percent: float = Field(40.0, ge=5, le=200)
-    trailing_stop_percent: float = Field(20.0, ge=5, le=50)
-    trailing_stop_after_scale_out_percent: float = Field(10.0, ge=2, le=30)
-    max_hold_minutes: int = Field(90, ge=10, le=300)
+    stop_loss_percent: float = Field(16.0, ge=1, le=100)
+    profit_target_percent: float = Field(40.0, ge=5, le=500)
+    trailing_stop_percent: float = Field(20.0, ge=1, le=100)
+    trailing_stop_after_scale_out_percent: float = Field(10.0, ge=1, le=100)
+    max_hold_minutes: int = Field(90, ge=1, le=300)
 
     scale_out_enabled: bool = True
     breakeven_trigger_percent: float = Field(10.0, ge=0, le=50)
@@ -61,9 +61,28 @@ class BacktestRequest(BaseModel):
     min_confluence: int = Field(5, ge=3, le=6)
     vol_threshold: float = Field(1.5, ge=1.0, le=3.0)
 
+    # Bollinger Bands & MACD
+    bb_period: int = Field(20, ge=5, le=50)
+    bb_std_mult: float = Field(2.0, ge=1.0, le=4.0)
+    macd_fast: int = Field(12, ge=5, le=30)
+    macd_slow: int = Field(26, ge=10, le=50)
+    macd_signal_period: int = Field(9, ge=3, le=20)
+
     max_daily_trades: int = Field(10, ge=1, le=50)
-    max_daily_loss: float = Field(500.0, ge=50, le=5000)
+    max_daily_loss: float = Field(2000.0, ge=50, le=5000)
     max_consecutive_losses: int = Field(3, ge=1, le=10)
+
+    vix_min: float = Field(0.0, ge=0, le=100, description="Min VIX to trade (0=disabled)")
+    vix_max: float = Field(100.0, ge=0, le=100, description="Max VIX to trade (100=disabled)")
+    entry_slippage_percent: float = Field(1.0, ge=0, le=10.0, description="Entry slippage percent (flat fallback)")
+    exit_slippage_percent: float = Field(1.0, ge=0, le=10.0, description="Exit slippage percent (flat fallback)")
+    spread_model_enabled: bool = Field(True, description="Dynamic bid-ask spread model (overrides flat slippage)")
+    entry_confirm_minutes: int = Field(0, ge=0, le=15, description="Minutes of 1m bars to confirm entry (0=immediate)")
+
+    # Pivot point S/R
+    pivot_enabled: bool = Field(False, description="Enable pivot point S/R levels")
+    pivot_proximity_pct: float = Field(0.3, ge=0.1, le=1.0, description="% proximity to pivot level")
+    pivot_filter_enabled: bool = Field(False, description="Block signals that fight S/R")
 
 
 class BacktestTradeResponse(BaseModel):
@@ -86,6 +105,8 @@ class BacktestTradeResponse(BaseModel):
     expiry_date: Optional[str] = None
     dte: int = 0
     delta: Optional[float] = None
+    entry_reason: Optional[str] = None
+    exit_detail: Optional[str] = None
 
 
 class BacktestDayResponse(BaseModel):
@@ -174,9 +195,23 @@ def run_backtest_endpoint(body: BacktestRequest):
         breakeven_trigger_percent=body.breakeven_trigger_percent,
         min_confluence=body.min_confluence,
         vol_threshold=body.vol_threshold,
+        bb_period=body.bb_period,
+        bb_std_mult=body.bb_std_mult,
+        macd_fast=body.macd_fast,
+        macd_slow=body.macd_slow,
+        macd_signal_period=body.macd_signal_period,
         max_daily_trades=body.max_daily_trades,
         max_daily_loss=body.max_daily_loss,
         max_consecutive_losses=body.max_consecutive_losses,
+        vix_min=body.vix_min,
+        vix_max=body.vix_max,
+        entry_slippage_percent=body.entry_slippage_percent,
+        exit_slippage_percent=body.exit_slippage_percent,
+        spread_model_enabled=body.spread_model_enabled,
+        entry_confirm_minutes=body.entry_confirm_minutes,
+        pivot_enabled=body.pivot_enabled,
+        pivot_proximity_pct=body.pivot_proximity_pct,
+        pivot_filter_enabled=body.pivot_filter_enabled,
     )
 
     try:
@@ -206,6 +241,8 @@ def run_backtest_endpoint(body: BacktestRequest):
             expiry_date=t.expiry_date.isoformat() if t.expiry_date else None,
             dte=t.dte,
             delta=t.delta,
+            entry_reason=t.entry_reason,
+            exit_detail=t.exit_detail,
         )
         for t in result.trades
     ]
@@ -251,11 +288,12 @@ class OptimizeRequest(BaseModel):
     data_source: str = Field("csv", description="csv | yfinance")
     bar_interval: str = Field("5m", description="1m | 5m | 10m | 15m | 30m")
     num_iterations: int = Field(200, ge=10, le=5000)
-    target_metric: str = Field("composite", description="total_pnl | profit_factor | win_rate | composite | risk_adjusted")
+    target_metric: str = Field("pro", description="total_pnl | profit_factor | win_rate | composite | risk_adjusted | sharpe | pro")
     top_n: int = Field(10, ge=1, le=50)
     afternoon_enabled: bool = True
     scale_out_enabled: bool = True
     quantity: int = Field(2, ge=1, le=10)
+    walk_forward: bool = Field(True, description="Enable walk-forward train/test split")
 
 
 class OptimizeResultEntry(BaseModel):
@@ -269,6 +307,12 @@ class OptimizeResultEntry(BaseModel):
     avg_hold_minutes: float
     score: float
     exit_reasons: dict[str, int]
+    # Out-of-sample (walk-forward) metrics
+    oos_total_pnl: Optional[float] = None
+    oos_total_trades: Optional[int] = None
+    oos_win_rate: Optional[float] = None
+    oos_profit_factor: Optional[float] = None
+    oos_score: Optional[float] = None
 
 
 class OptimizeResponse(BaseModel):
@@ -276,6 +320,11 @@ class OptimizeResponse(BaseModel):
     elapsed_seconds: float
     target_metric: str
     results: list[OptimizeResultEntry]
+    # Walk-forward date ranges
+    train_start: Optional[str] = None
+    train_end: Optional[str] = None
+    test_start: Optional[str] = None
+    test_end: Optional[str] = None
 
 
 # ── Helpers ───────────────────────────────────────────────────────
@@ -353,7 +402,7 @@ def run_optimize_endpoint(body: OptimizeRequest):
         if body.bar_interval == "1m" and days_span > 7:
             raise HTTPException(400, "1-minute bars limited to 7 days (yfinance constraint)")
 
-    valid_metrics = ("total_pnl", "profit_factor", "win_rate", "composite", "risk_adjusted")
+    valid_metrics = ("total_pnl", "profit_factor", "win_rate", "composite", "risk_adjusted", "sharpe", "pro")
     if body.target_metric not in valid_metrics:
         raise HTTPException(400, f"target_metric must be one of {valid_metrics}")
 
@@ -368,6 +417,7 @@ def run_optimize_endpoint(body: OptimizeRequest):
         afternoon_enabled=body.afternoon_enabled,
         scale_out_enabled=body.scale_out_enabled,
         quantity=body.quantity,
+        walk_forward=body.walk_forward,
     )
 
     try:
@@ -388,6 +438,11 @@ def run_optimize_endpoint(body: OptimizeRequest):
             avg_hold_minutes=r.avg_hold_minutes,
             score=r.score,
             exit_reasons=r.exit_reasons,
+            oos_total_pnl=r.oos_total_pnl,
+            oos_total_trades=r.oos_total_trades,
+            oos_win_rate=r.oos_win_rate,
+            oos_profit_factor=r.oos_profit_factor,
+            oos_score=r.oos_score,
         )
         for r in result.results
     ]
@@ -404,4 +459,8 @@ def run_optimize_endpoint(body: OptimizeRequest):
         elapsed_seconds=result.elapsed_seconds,
         target_metric=body.target_metric,
         results=response_entries,
+        train_start=result.train_start.isoformat() if result.train_start else None,
+        train_end=result.train_end.isoformat() if result.train_end else None,
+        test_start=result.test_start.isoformat() if result.test_start else None,
+        test_end=result.test_end.isoformat() if result.test_end else None,
     )

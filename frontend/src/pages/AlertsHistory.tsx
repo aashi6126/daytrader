@@ -30,7 +30,7 @@ export default function AlertsHistory() {
 
   return (
     <div className="max-w-7xl mx-auto px-4 py-6 space-y-6">
-      <h1 className="text-2xl font-bold">Alerts History</h1>
+      <h1 className="text-2xl font-bold">Signals</h1>
 
       <div className="flex flex-wrap gap-4">
         <div>

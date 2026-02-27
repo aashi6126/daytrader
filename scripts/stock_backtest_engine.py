@@ -11,6 +11,7 @@ P&L = (exit_price - entry_price) * quantity * 100.
 This module is imported by multi_ticker_optimizer.py.
 """
 
+import bisect
 import logging
 import os
 import sys
@@ -26,7 +27,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 
 from app.services.backtest.black_scholes import (
     estimate_option_price_at,
+    estimate_option_price_and_delta,
     select_strike_for_delta,
+)
+from app.services.backtest.spread_model import (
+    estimate_spread_pct,
 )
 from app.services.backtest.engine import (
     BacktestParams,
@@ -46,6 +51,20 @@ _DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data
 
 # Tickers with daily (0DTE) expirations; all others use weekly (Friday) expiry
 _0DTE_TICKERS = {"SPY", "QQQ"}
+
+# Per-ticker liquidity multiplier for bid-ask spread model.
+# Spread model is calibrated to SPY 0DTE (tier 1). Other tickers have wider spreads.
+LIQUIDITY_TIERS: dict[str, float] = {
+    # Tier 1: Ultra-liquid, 0DTE available (calibration baseline)
+    "SPY": 1.0, "QQQ": 1.0,
+    # Tier 2: Very liquid large caps
+    "AAPL": 1.5, "MSFT": 1.5, "AMZN": 1.5, "NVDA": 1.5, "TSLA": 1.5,
+    "GOOGL": 1.5, "AMD": 1.5, "META": 1.5,
+    # Tier 3: Liquid mid-caps / ETFs
+    "GLD": 2.0, "PLTR": 2.0, "COIN": 2.0, "SQ": 2.0, "SHOP": 2.0,
+    "CRM": 2.0, "UBER": 2.0, "MARA": 2.0,
+}
+DEFAULT_LIQUIDITY_MULT = 2.5  # unmapped tickers (moderate liquidity assumption)
 
 
 def _strike_interval(ticker_price: float) -> float:
@@ -99,6 +118,84 @@ def _compute_historical_vol(bars_by_day: dict[date, list[BarData]]) -> float:
     return round(max(annualized_vol, 10.0), 1)
 
 
+def _compute_rolling_vol(
+    bars_by_day: dict[date, list[BarData]],
+    window: int = 21,
+) -> dict[date, float]:
+    """Compute rolling annualized historical volatility per trading day.
+
+    For each day, uses the prior `window` days of daily close-to-close
+    log returns to estimate annualized vol. Returns a dict[date, float]
+    where vol is expressed as a percentage (e.g. 41.0 for 41%).
+
+    Falls back to the full-history vol for days with insufficient lookback.
+    """
+    import math
+
+    dates = sorted(bars_by_day.keys())
+    if len(dates) < window + 1:
+        # Not enough data for rolling window — use flat vol
+        flat = _compute_historical_vol(bars_by_day)
+        return {d: flat for d in dates}
+
+    # Build daily closing prices
+    daily_closes: list[tuple[date, float]] = []
+    for d in dates:
+        day_bars = bars_by_day[d]
+        if day_bars:
+            daily_closes.append((d, day_bars[-1].close))
+
+    if len(daily_closes) < window + 1:
+        flat = _compute_historical_vol(bars_by_day)
+        return {d: flat for d in dates}
+
+    # Compute log returns
+    log_returns: list[tuple[date, float]] = []
+    for i in range(1, len(daily_closes)):
+        if daily_closes[i - 1][1] > 0:
+            lr = math.log(daily_closes[i][1] / daily_closes[i - 1][1])
+            log_returns.append((daily_closes[i][0], lr))
+
+    # Build rolling vol for each day using O(1) sliding window
+    result: dict[date, float] = {}
+    fallback = _compute_historical_vol(bars_by_day)
+    returns_only = [r for _, r in log_returns]
+    sqrt_252_x100 = math.sqrt(252) * 100
+
+    # Fill early days with fallback
+    for i in range(min(window, len(log_returns))):
+        result[log_returns[i][0]] = fallback
+
+    if len(returns_only) >= window:
+        # Initialize sliding window sums
+        window_sum = sum(returns_only[:window])
+        window_sq_sum = sum(r * r for r in returns_only[:window])
+
+        for i in range(window, len(log_returns)):
+            d = log_returns[i][0]
+            # Slide: add newest, remove oldest
+            new_val = returns_only[i]
+            old_val = returns_only[i - window]
+            window_sum += new_val - old_val
+            window_sq_sum += new_val * new_val - old_val * old_val
+
+            mean = window_sum / window
+            # Var = (sum_sq/n - mean^2) * n/(n-1)  [Bessel's correction]
+            variance = (window_sq_sum / window - mean * mean) * window / (window - 1)
+            if variance > 0:
+                annualized = math.sqrt(variance) * sqrt_252_x100
+                result[d] = round(max(annualized, 10.0), 1)
+            else:
+                result[d] = fallback
+
+    # Fill in any dates not covered by log_returns
+    for d in dates:
+        if d not in result:
+            result[d] = fallback
+
+    return result
+
+
 # ── Data classes ──────────────────────────────────────────────────
 
 
@@ -135,8 +232,8 @@ class StockBacktestParams:
 
     # Entry — options
     quantity: int = 2
-    delta_target: float = 0.40
-    entry_limit_below_percent: float = 5.0
+    delta_target: float = 0.35
+    entry_limit_below_percent: float = 0.0  # removed: 5% free edge doesn't exist in live trading
 
     # Exit (options-level percentages)
     stop_loss_percent: float = 16.0
@@ -151,9 +248,9 @@ class StockBacktestParams:
     breakeven_trigger_percent: float = 10.0
 
     # ORB direction filter params
-    orb_body_min_pct: float = 0.0
-    orb_vwap_filter: bool = False
-    orb_gap_fade_filter: bool = False
+    orb_body_min_pct: float = 0.4
+    orb_vwap_filter: bool = True
+    orb_gap_fade_filter: bool = True
     orb_time_stop: time = field(default_factory=lambda: time(14, 0))
     orb_stop_mult: float = 1.0
     orb_target_mult: float = 1.5
@@ -163,10 +260,35 @@ class StockBacktestParams:
     vol_sma_period: int = 20
     vol_threshold: float = 1.5
 
+    # Bollinger Bands
+    bb_period: int = 20
+    bb_std_mult: float = 2.0
+
+    # MACD
+    macd_fast: int = 12
+    macd_slow: int = 26
+    macd_signal_period: int = 9
+
+    # Pivot point S/R (7th confluence factor + optional entry filter)
+    pivot_enabled: bool = False
+    pivot_proximity_pct: float = 0.3
+    pivot_filter_enabled: bool = False
+
     # Limits
     max_daily_trades: int = 10
-    max_daily_loss: float = 500.0
+    max_daily_loss: float = 2000.0
     max_consecutive_losses: int = 3
+
+    # VIX filter (skip trades when VIX outside range; 0/100 = disabled)
+    vix_min: float = 0.0
+    vix_max: float = 100.0
+
+    # Exit slippage: reduce exit prices by this percent to model bid-ask spread
+    exit_slippage_percent: float = 0.0
+    spread_model_enabled: bool = True     # dynamic spread from delta/time/VIX (overrides flat %)
+
+    # Entry confirmation: require N 1-minute bars to confirm direction (0 = immediate)
+    entry_confirm_minutes: int = 0
 
 
 @dataclass
@@ -201,6 +323,9 @@ class StockTrade:
     dte: int = 0
     delta: Optional[float] = None
 
+    entry_reason: Optional[str] = None
+    exit_detail: Optional[str] = None
+
 
 @dataclass
 class StockDailyResult:
@@ -230,6 +355,8 @@ class StockBacktestResult:
     profit_factor: float = 0.0
     avg_hold_minutes: float = 0.0
     exit_reasons: dict[str, int] = field(default_factory=dict)
+    avg_entry_price: float = 0.0
+    max_entry_price: float = 0.0
 
 
 # ── Data loading ──────────────────────────────────────────────────
@@ -244,7 +371,7 @@ def load_ticker_csv_bars(
     """Load bars from local CSV files in the data/ directory."""
     interval_map = {"1m": "1min", "5m": "5min", "10m": "10min", "15m": "15min", "30m": "30min"}
     csv_label = interval_map.get(interval, interval.replace("m", "min"))
-    csv_path = os.path.normpath(os.path.join(_DATA_DIR, f"{ticker}_{csv_label}_6months.csv"))
+    csv_path = os.path.normpath(os.path.join(_DATA_DIR, ticker, f"{ticker}_{csv_label}_6months.csv"))
 
     if not os.path.exists(csv_path):
         logger.warning(f"CSV not found: {csv_path}")
@@ -346,10 +473,15 @@ def _close_trade(
     exit_time: datetime,
     exit_price: float,
     exit_reason: str,
+    exit_slippage_percent: float = 0.0,
+    exit_detail: str = "",
 ) -> None:
+    if exit_slippage_percent > 0:
+        exit_price = max(exit_price * (1 - exit_slippage_percent / 100), 0.01)
     trade.exit_time = exit_time
     trade.exit_price = exit_price
     trade.exit_reason = exit_reason
+    trade.exit_detail = exit_detail or None
     trade.hold_minutes = (exit_time - trade.entry_time).total_seconds() / 60
 
     remaining_qty = trade.quantity - trade.scaled_out_quantity
@@ -374,6 +506,8 @@ def _simulate_option_trade(
     params: StockBacktestParams,
     atr_at_entry: Optional[float] = None,
     expiry_date: Optional[date] = None,
+    is_0dte: bool = True,
+    liquidity_mult: float = 1.0,
 ) -> None:
     """Walk bars and apply exit rules using option pricing."""
     trade.highest_price_seen = trade.entry_price
@@ -406,10 +540,31 @@ def _simulate_option_trade(
 
     for bar in bars_after:
         mtc = _minutes_to_expiry(bar.timestamp, expiry_date) if expiry_date else _minutes_to_close(bar.timestamp)
-        opt_price = max(
-            estimate_option_price_at(bar.close, trade.strike, mtc, vix, trade.direction),
-            0.01,
-        )
+        # Combined B-S call: get both price and delta in one shot
+        opt_result = estimate_option_price_and_delta(bar.close, trade.strike, mtc, vix, trade.direction)
+        opt_price = max(opt_result.price, 0.01)
+
+        # Intrabar stop check: estimate option price at worst underlying level
+        # CALL worst = bar.low (underlying drops), PUT worst = bar.high (underlying rises)
+        if not use_orb_stops:
+            worst_underlying = bar.low if trade.direction == "CALL" else bar.high
+            opt_price_worst = max(
+                estimate_option_price_at(worst_underlying, trade.strike, mtc, vix, trade.direction),
+                0.01,
+            )
+        else:
+            opt_price_worst = opt_price  # ORB stops use underlying levels, not option price
+
+        # Compute per-bar exit slippage (dynamic spread or flat)
+        if params.spread_model_enabled:
+            mtc_close = _minutes_to_close(bar.timestamp)
+            exit_spread = estimate_spread_pct(
+                opt_result.delta, mtc_close, vix, opt_price, is_0dte=is_0dte,
+                liquidity_mult=liquidity_mult,
+            )
+            bar_slippage = exit_spread / 2 * 100
+        else:
+            bar_slippage = params.exit_slippage_percent
 
         if opt_price > trade.highest_price_seen:
             trade.highest_price_seen = opt_price
@@ -419,30 +574,38 @@ def _simulate_option_trade(
 
         # P1: Force exit at day end
         if bar.timestamp.time() >= params.force_exit_time:
-            _close_trade(trade, bar.timestamp, opt_price, "TIME_BASED")
+            _close_trade(trade, bar.timestamp, opt_price, "TIME_BASED", bar_slippage,
+                         exit_detail=f"Force exit at {bar.timestamp.strftime('%H:%M')} (opt ${opt_price:.2f})")
             return
 
         # ORB time stop
         if use_orb_stops and bar.timestamp.time() >= params.orb_time_stop:
-            _close_trade(trade, bar.timestamp, opt_price, "ORB_TIME_STOP")
+            _close_trade(trade, bar.timestamp, opt_price, "ORB_TIME_STOP", bar_slippage,
+                         exit_detail=f"ORB time stop at {bar.timestamp.strftime('%H:%M')} (opt ${opt_price:.2f})")
             return
 
         # P2: Max hold
         if elapsed >= params.max_hold_minutes:
-            _close_trade(trade, bar.timestamp, opt_price, "MAX_HOLD_TIME")
+            _close_trade(trade, bar.timestamp, opt_price, "MAX_HOLD_TIME", bar_slippage,
+                         exit_detail=f"Held {elapsed:.0f}min (max {params.max_hold_minutes}min)")
             return
 
-        # P3: Stop loss
+        # P3: Stop loss (intrabar: check worst-case price within bar)
         if use_orb_stops:
             if trade.direction == "CALL" and bar.low <= spy_stop:
-                _close_trade(trade, bar.timestamp, opt_price, "STOP_LOSS")
+                _close_trade(trade, bar.timestamp, opt_price, "STOP_LOSS", bar_slippage,
+                             exit_detail=f"Underlying ${bar.low:.2f} hit ORB stop ${spy_stop:.2f}")
                 return
             elif trade.direction == "PUT" and bar.high >= spy_stop:
-                _close_trade(trade, bar.timestamp, opt_price, "STOP_LOSS")
+                _close_trade(trade, bar.timestamp, opt_price, "STOP_LOSS", bar_slippage,
+                             exit_detail=f"Underlying ${bar.high:.2f} hit ORB stop ${spy_stop:.2f}")
                 return
         else:
-            if opt_price <= stop_price:
-                _close_trade(trade, bar.timestamp, opt_price, "STOP_LOSS")
+            # Intrabar stop: if worst-case option price breached stop, fill at actual worst price
+            if opt_price_worst <= stop_price:
+                fill_price = opt_price_worst  # realistic fill at actual worst price, not ideal stop level
+                _close_trade(trade, bar.timestamp, fill_price, "STOP_LOSS", bar_slippage,
+                             exit_detail=f"Opt ${opt_price_worst:.2f} <= stop ${stop_price:.2f} (-{params.stop_loss_percent:.0f}%)")
                 return
 
         # Breakeven stop adjustment (non-ORB only)
@@ -458,10 +621,12 @@ def _simulate_option_trade(
         # P4: Profit target
         if use_orb_stops:
             if trade.direction == "CALL" and bar.high >= spy_target:
-                _close_trade(trade, bar.timestamp, opt_price, "PROFIT_TARGET")
+                _close_trade(trade, bar.timestamp, opt_price, "PROFIT_TARGET", bar_slippage,
+                             exit_detail=f"Underlying ${bar.high:.2f} hit ORB target ${spy_target:.2f}")
                 return
             elif trade.direction == "PUT" and bar.low <= spy_target:
-                _close_trade(trade, bar.timestamp, opt_price, "PROFIT_TARGET")
+                _close_trade(trade, bar.timestamp, opt_price, "PROFIT_TARGET", bar_slippage,
+                             exit_detail=f"Underlying ${bar.low:.2f} hit ORB target ${spy_target:.2f}")
                 return
         else:
             if gain_pct >= params.profit_target_percent:
@@ -470,7 +635,8 @@ def _simulate_option_trade(
                     trade.scaled_out_quantity = trade.quantity // 2
                     trade.scaled_out_price = opt_price
                 elif not trade.scaled_out:
-                    _close_trade(trade, bar.timestamp, opt_price, "PROFIT_TARGET")
+                    _close_trade(trade, bar.timestamp, opt_price, "PROFIT_TARGET", bar_slippage,
+                                 exit_detail=f"Gain {gain_pct:.1f}% >= {params.profit_target_percent:.0f}% (opt ${opt_price:.2f})")
                     return
 
         # P5: Trailing stop
@@ -482,18 +648,27 @@ def _simulate_option_trade(
             )
             trail_price = trade.highest_price_seen * (1 - trail_pct / 100)
             if opt_price <= trail_price:
-                _close_trade(trade, bar.timestamp, opt_price, "TRAILING_STOP")
+                _close_trade(trade, bar.timestamp, opt_price, "TRAILING_STOP", bar_slippage,
+                             exit_detail=f"Opt ${opt_price:.2f} <= trail ${trail_price:.2f} (peak ${trade.highest_price_seen:.2f}, {trail_pct:.0f}%)")
                 return
 
     # End of day — force close at last bar
     if trade.exit_time is None and bars_after:
         last = bars_after[-1]
         mtc = _minutes_to_expiry(last.timestamp, expiry_date) if expiry_date else _minutes_to_close(last.timestamp)
-        last_price = max(
-            estimate_option_price_at(last.close, trade.strike, mtc, vix, trade.direction),
-            0.01,
-        )
-        _close_trade(trade, last.timestamp, last_price, "TIME_BASED")
+        eod_result = estimate_option_price_and_delta(last.close, trade.strike, mtc, vix, trade.direction)
+        last_price = max(eod_result.price, 0.01)
+        if params.spread_model_enabled:
+            mtc_close = _minutes_to_close(last.timestamp)
+            exit_spread = estimate_spread_pct(
+                eod_result.delta, mtc_close, vix, last_price, is_0dte=is_0dte,
+                liquidity_mult=liquidity_mult,
+            )
+            eod_slippage = exit_spread / 2 * 100
+        else:
+            eod_slippage = params.exit_slippage_percent
+        _close_trade(trade, last.timestamp, last_price, "TIME_BASED", eod_slippage,
+                     exit_detail=f"EOD close (opt ${last_price:.2f})")
 
 
 # ── Summary computation ───────────────────────────────────────────
@@ -547,6 +722,12 @@ def _compute_summary(result: StockBacktestResult) -> None:
         reasons[r] = reasons.get(r, 0) + 1
     result.exit_reasons = reasons
 
+    # Entry price stats (for capital calculations)
+    entry_prices = [t.entry_price for t in trades if t.entry_price > 0]
+    if entry_prices:
+        result.avg_entry_price = round(sum(entry_prices) / len(entry_prices), 2)
+        result.max_entry_price = round(max(entry_prices), 2)
+
 
 # ── VIX data loading ─────────────────────────────────────────────
 
@@ -576,6 +757,7 @@ def run_stock_backtest(
     params: StockBacktestParams,
     bars_by_day: Optional[dict[date, list[BarData]]] = None,
     vix_by_day: Optional[dict[date, float]] = None,
+    rolling_vol: Optional[dict[date, float]] = None,
 ) -> StockBacktestResult:
     """Run an options-level backtest using Black-Scholes pricing for any ticker."""
 
@@ -619,29 +801,66 @@ def run_stock_backtest(
         min_confluence=params.min_confluence,
         vol_sma_period=params.vol_sma_period,
         vol_threshold=params.vol_threshold,
+        bb_period=params.bb_period,
+        bb_std_mult=params.bb_std_mult,
+        macd_fast=params.macd_fast,
+        macd_slow=params.macd_slow,
+        macd_signal_period=params.macd_signal_period,
+        entry_confirm_minutes=params.entry_confirm_minutes,
+        pivot_enabled=params.pivot_enabled,
+        pivot_proximity_pct=params.pivot_proximity_pct,
+        pivot_filter_enabled=params.pivot_filter_enabled,
     )
 
     result = StockBacktestResult(params=params)
     default_vix = 20.0
     prev_close: Optional[float] = None
+    prev_high: Optional[float] = None
+    prev_low: Optional[float] = None
     is_0dte = params.ticker in _0DTE_TICKERS
+    liq_mult = LIQUIDITY_TIERS.get(params.ticker, DEFAULT_LIQUIDITY_MULT)
 
-    # For non-SPY/QQQ, compute per-ticker historical vol from full CSV
-    ticker_vol: Optional[float] = None
-    if not is_0dte:
+    # Fetch 1-minute bars for entry confirmation if needed
+    confirm_bars_by_day: Optional[dict] = None
+    if params.entry_confirm_minutes > 0:
+        confirm_bars_by_day = load_ticker_csv_bars(params.ticker, params.start_date, params.end_date, "1m")
+
+    # For non-SPY/QQQ, use precomputed rolling vol or compute it
+    if not is_0dte and rolling_vol is None:
         all_bars = load_ticker_csv_bars(
             params.ticker, date(2000, 1, 1), date(2099, 12, 31), params.bar_interval
         )
-        ticker_vol = _compute_historical_vol(all_bars)
-        logger.info(f"{params.ticker} historical vol: {ticker_vol}%")
+        rolling_vol = _compute_rolling_vol(all_bars)
+        logger.info(f"{params.ticker} rolling vol computed ({len(rolling_vol or {})} days), liquidity_mult={liq_mult}")
 
     for trade_date in sorted(bars_by_day.keys()):
         day_bars = bars_by_day[trade_date]
-        # Use per-ticker vol for stocks, VIX for SPY/QQQ
-        vix = vix_by_day.get(trade_date, default_vix) if is_0dte else (ticker_vol or default_vix)
+        # Use per-day rolling vol for stocks, VIX for SPY/QQQ
+        if is_0dte:
+            vix = vix_by_day.get(trade_date, default_vix)
+        else:
+            vix = (rolling_vol or {}).get(trade_date, default_vix)
+
+        # VIX regime filter: skip day if VIX is outside [vix_min, vix_max]
+        # Always use actual VIX for the filter (not ticker_vol), since VIX
+        # measures broad market regime regardless of which ticker we trade.
+        day_vix = vix_by_day.get(trade_date, default_vix)
+        if day_vix < params.vix_min or day_vix > params.vix_max:
+            if day_bars:
+                prev_close = day_bars[-1].close
+                prev_high = max(b.high for b in day_bars)
+                prev_low = min(b.low for b in day_bars)
+            result.days.append(StockDailyResult(trade_date=trade_date))
+            continue
+
         day_result = StockDailyResult(trade_date=trade_date)
 
-        signals = _generate_signals(day_bars, engine_params, prev_close=prev_close)
+        confirm_day = confirm_bars_by_day.get(trade_date) if confirm_bars_by_day else None
+        signals = _generate_signals(
+            day_bars, engine_params, prev_close=prev_close,
+            prev_high=prev_high, prev_low=prev_low,
+            confirm_bars=confirm_day,
+        )
 
         # Precompute ATR if enabled
         day_atr: list[Optional[float]] = [None] * len(day_bars)
@@ -652,6 +871,9 @@ def run_stock_backtest(
         daily_pnl = 0.0
         consecutive_losses = 0
         last_exit_time: Optional[datetime] = None
+
+        # Precompute sorted timestamps for bisect-based entry bar lookup
+        bar_timestamps = [b.timestamp for b in day_bars]
 
         for signal in signals:
             # Limits
@@ -693,16 +915,19 @@ def run_stock_backtest(
                 strike_interval=interval,
             )
 
-            entry_price = round(
-                max(opt_data.price * (1 - params.entry_limit_below_percent / 100), 0.01),
-                2,
-            )
+            limit_price = opt_data.price * (1 - params.entry_limit_below_percent / 100)
+            if params.spread_model_enabled:
+                mtc_close = _minutes_to_close(signal.timestamp)
+                entry_spread = estimate_spread_pct(
+                    opt_data.delta, mtc_close, vix, limit_price, is_0dte=is_0dte,
+                    liquidity_mult=liq_mult,
+                )
+                entry_price = round(max(limit_price * (1 + entry_spread / 2), 0.01), 2)
+            else:
+                entry_price = round(max(limit_price, 0.01), 2)
 
-            entry_idx = next(
-                (i for i, b in enumerate(day_bars) if b.timestamp >= signal.timestamp),
-                None,
-            )
-            if entry_idx is None:
+            entry_idx = bisect.bisect_left(bar_timestamps, signal.timestamp)
+            if entry_idx >= len(day_bars):
                 continue
             bars_after = day_bars[entry_idx + 1:]
             if not bars_after:
@@ -722,11 +947,13 @@ def run_stock_backtest(
                 expiry_date=expiry,
                 dte=dte,
                 delta=round(opt_data.delta, 4),
+                entry_reason=signal.reason,
             )
 
             atr_val = day_atr[entry_idx] if entry_idx < len(day_atr) else None
             _simulate_option_trade(trade, bars_after, vix, params, atr_at_entry=atr_val,
-                                   expiry_date=expiry if not is_0dte else None)
+                                   expiry_date=expiry if not is_0dte else None,
+                                   is_0dte=is_0dte, liquidity_mult=liq_mult)
 
             if trade.exit_time is not None:
                 daily_trades += 1
@@ -746,6 +973,8 @@ def run_stock_backtest(
         day_result.pnl = round(daily_pnl, 2)
         if day_bars:
             prev_close = day_bars[-1].close
+            prev_high = max(b.high for b in day_bars)
+            prev_low = min(b.low for b in day_bars)
         result.days.append(day_result)
 
     _compute_summary(result)

@@ -11,11 +11,12 @@ from fastapi.staticfiles import StaticFiles
 from app.config import Settings
 from app.dependencies import get_ws_manager
 from app.models import Base
-from app.routers import alerts, auth, backtest, dashboard, snapshots, stock_backtest, testing, trades, webhook
+from app.routers import alerts, assistant, auth, backtest, dashboard, snapshots, stock_backtest, strategies, testing, trades, webhook
 from app.routers import websocket as ws_router
 from app.tasks.eod_cleanup import EODCleanupTask
 from app.tasks.exit_monitor import ExitMonitorTask
 from app.tasks.order_monitor import OrderMonitorTask
+from app.tasks.price_recorder import PriceRecorderTask
 
 settings = Settings()
 logging.basicConfig(
@@ -40,10 +41,39 @@ async def lifespan(app: FastAPI):
         conn = sqlite3.connect(db_path)
         conn.execute("ALTER TABLE trades ADD COLUMN scale_out_count INTEGER DEFAULT 0")
         conn.commit()
-        conn.close()
         logger.info("Added scale_out_count column to trades table")
     except sqlite3.OperationalError:
         pass  # Column already exists
+
+    try:
+        conn.execute("ALTER TABLE trades ADD COLUMN ticker VARCHAR(10) DEFAULT 'SPY'")
+        conn.commit()
+        logger.info("Added ticker column to trades table")
+    except sqlite3.OperationalError:
+        pass  # Column already exists
+
+    # Per-trade exit params (strategy-specific overrides)
+    for col_name, col_type in [
+        ("param_stop_loss_percent", "FLOAT"),
+        ("param_profit_target_percent", "FLOAT"),
+        ("param_trailing_stop_percent", "FLOAT"),
+        ("param_max_hold_minutes", "INTEGER"),
+        ("entry_atr_value", "FLOAT"),
+        ("param_atr_stop_mult", "FLOAT"),
+        ("param_delta_target", "FLOAT"),
+        ("entry_regime", "VARCHAR(30)"),
+        ("entry_regime_confidence", "FLOAT"),
+        ("entry_vix", "FLOAT"),
+        ("adapter_applied", "BOOLEAN DEFAULT 0"),
+    ]:
+        try:
+            conn.execute(f"ALTER TABLE trades ADD COLUMN {col_name} {col_type}")
+            conn.commit()
+            logger.info(f"Added {col_name} column to trades table")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+
+    conn.close()
 
     # Initialize Schwab client (OAuth2 or Paper)
     if settings.PAPER_TRADE:
@@ -81,18 +111,65 @@ async def lifespan(app: FastAPI):
     app.state.ws_manager = get_ws_manager()
     app.state.ignore_trading_windows = False
 
+    # Initialize Schwab streaming service
+    from app.dependencies import get_streaming_service
+
+    streaming = get_streaming_service()
+    if (
+        app.state.schwab_client
+        and settings.STREAMING_ENABLED
+        and not settings.PAPER_TRADE
+    ):
+        try:
+            await streaming.start(app.state.schwab_client)
+            await streaming.subscribe_account_activity()
+            app.state.streaming_service = streaming
+            logger.info("Schwab streaming service initialized")
+        except Exception as e:
+            logger.warning(
+                f"Streaming service failed to start: {e}. Falling back to REST polling."
+            )
+            app.state.streaming_service = None
+    else:
+        app.state.streaming_service = None
+        if settings.PAPER_TRADE:
+            logger.info("Streaming disabled in PAPER_TRADE mode")
+        elif not settings.STREAMING_ENABLED:
+            logger.info("Streaming disabled by STREAMING_ENABLED=False")
+
     # Start background tasks
     tasks = []
     if app.state.schwab_client:
         tasks.append(asyncio.create_task(OrderMonitorTask(app).run()))
         tasks.append(asyncio.create_task(ExitMonitorTask(app).run()))
+        tasks.append(asyncio.create_task(PriceRecorderTask(app).run()))
         tasks.append(asyncio.create_task(EODCleanupTask(app).run()))
 
         if settings.ACTIVE_STRATEGY == "orb_auto":
             from app.tasks.orb_signal import ORBSignalTask
 
-            tasks.append(asyncio.create_task(ORBSignalTask(app).run()))
+            orb_task = asyncio.create_task(ORBSignalTask(app).run())
+            app.state.orb_task = orb_task
+            tasks.append(orb_task)
             logger.info("ORB auto strategy task started")
+
+        # Load enabled strategies from file (multi-strategy)
+        from app.routers.strategies import _read_strategies, _strategy_key
+
+        app.state.strategy_tasks = {}
+        for _sc in _read_strategies():
+            from app.tasks.strategy_signal import StrategySignalTask
+
+            _key = _strategy_key(_sc["ticker"], _sc["signal_type"], _sc["timeframe"])
+            _st = asyncio.create_task(StrategySignalTask(app, _sc).run())
+            app.state.strategy_tasks[_key] = _st
+            tasks.append(_st)
+            logger.info(
+                f"Strategy signal task started: {_sc['ticker']} "
+                f"{_sc['signal_type']} @ {_sc['timeframe']}"
+            )
+        if app.state.strategy_tasks:
+            logger.info(f"{len(app.state.strategy_tasks)} strategy task(s) loaded")
 
         if settings.DATA_RECORDER_ENABLED and not settings.PAPER_TRADE:
             from app.tasks.data_recorder import DataRecorderTask
@@ -103,6 +180,11 @@ async def lifespan(app: FastAPI):
         logger.info("Background tasks started")
 
     yield
+
+    # Stop streaming
+    if getattr(app.state, "streaming_service", None):
+        await streaming.stop()
+        logger.info("Streaming service stopped")
 
     for task in tasks:
         task.cancel()
@@ -129,6 +211,8 @@ def create_app() -> FastAPI:
     app.include_router(snapshots.router, prefix="/api", tags=["snapshots"])
     app.include_router(backtest.router, prefix="/api", tags=["backtest"])
     app.include_router(stock_backtest.router, prefix="/api", tags=["stock-backtest"])
+    app.include_router(strategies.router, prefix="/api", tags=["strategies"])
+    app.include_router(assistant.router, prefix="/api", tags=["assistant"])
     app.include_router(ws_router.router, tags=["websocket"])
 
     # Serve frontend static files (built React app)

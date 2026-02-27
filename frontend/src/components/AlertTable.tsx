@@ -68,9 +68,17 @@ export function AlertTable({ alerts }: Props) {
                   <span className={`text-xs px-1.5 py-0.5 rounded ${
                     alert.source === 'test'
                       ? 'bg-purple-900/50 text-purple-400'
-                      : 'bg-sky-900/50 text-sky-400'
+                      : alert.source === 'strategy_signal'
+                        ? 'bg-emerald-900/50 text-emerald-400'
+                        : alert.source === 'orb_auto'
+                          ? 'bg-amber-900/50 text-amber-400'
+                          : 'bg-sky-900/50 text-sky-400'
                   }`}>
-                    {alert.source === 'test' ? 'Test' : 'TradingView'}
+                    {alert.source === 'test' ? 'Test'
+                      : alert.source === 'strategy_signal' ? 'Strategy'
+                      : alert.source === 'orb_auto' ? 'ORB Auto'
+                      : alert.source === 'retake' ? 'Retake'
+                      : 'TradingView'}
                   </span>
                 </td>
                 <td className="py-2 pr-4 font-mono">{alert.ticker}</td>

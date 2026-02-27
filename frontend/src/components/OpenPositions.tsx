@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import type { Trade, QuoteItem } from '../types'
-import { formatCurrency, formatTime } from '../utils/format'
+import { formatCurrency, formatTime, isMarketOpen } from '../utils/format'
 import { fetchOpenQuotes, closeTrade, cancelTrade } from '../api/trades'
 
 interface Props {
@@ -40,6 +40,7 @@ export function OpenPositions({ trades, onClose }: Props) {
     }
 
     load()
+    if (!isMarketOpen()) return
     const interval = setInterval(load, 5000)
     return () => clearInterval(interval)
   }, [trades.length])

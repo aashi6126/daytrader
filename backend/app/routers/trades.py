@@ -7,8 +7,11 @@ from pydantic import BaseModel
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
+from app.config import Settings
 from app.database import get_db
 from app.dependencies import get_trade_manager
+
+settings = Settings()
 from app.models import Alert, Trade, TradeEvent, TradePriceSnapshot, TradeStatus
 from app.schemas import PriceSnapshotListResponse, PriceSnapshotResponse, TradeEventListResponse, TradeEventResponse, TradeListResponse, TradeResponse, WebhookResponse
 from app.services.schwab_client import SchwabService
@@ -296,6 +299,116 @@ async def cancel_pending_trade(
     })
 
     return {"status": "cancelled", "message": f"Trade #{trade.id} entry order cancelled"}
+
+
+@router.post("/trades/{trade_id}/cancel-stop-loss")
+async def cancel_stop_loss(
+    trade_id: int,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """Cancel the stop-loss order on an active trade."""
+    from app.dependencies import get_schwab_service, get_ws_manager
+    from app.models import TradeEventType
+    from app.services.trade_events import log_trade_event
+
+    trade = db.query(Trade).filter(Trade.id == trade_id).first()
+    if not trade:
+        raise HTTPException(status_code=404, detail="Trade not found")
+
+    if trade.status not in (TradeStatus.FILLED, TradeStatus.STOP_LOSS_PLACED):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Trade #{trade.id} is not active (status: {trade.status.value})",
+        )
+
+    if not trade.stop_loss_order_id:
+        raise HTTPException(status_code=400, detail=f"Trade #{trade.id} has no stop-loss order")
+
+    schwab = get_schwab_service(request)
+    try:
+        schwab.cancel_order(trade.stop_loss_order_id)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to cancel stop-loss: {e}")
+
+    old_order_id = trade.stop_loss_order_id
+    trade.stop_loss_order_id = None
+    trade.stop_loss_price = None
+    trade.status = TradeStatus.FILLED
+    log_trade_event(
+        db, trade.id, TradeEventType.STOP_LOSS_CANCELLED,
+        f"Stop-loss order {old_order_id} cancelled manually via UI",
+        details={"order_id": old_order_id},
+    )
+    db.commit()
+
+    ws = get_ws_manager()
+    await ws.broadcast({
+        "event": "trade_stop_loss_cancelled",
+        "data": {"trade_id": trade.id},
+    })
+
+    return {"status": "ok", "message": f"Trade #{trade.id} stop-loss cancelled"}
+
+
+@router.post("/trades/{trade_id}/replace-stop-loss")
+async def replace_stop_loss(
+    trade_id: int,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """Cancel existing stop-loss and re-place at current STOP_LOSS_PERCENT."""
+    from app.dependencies import get_schwab_service, get_ws_manager
+    from app.models import TradeEventType
+    from app.services.trade_events import log_trade_event
+
+    trade = db.query(Trade).filter(Trade.id == trade_id).first()
+    if not trade:
+        raise HTTPException(status_code=404, detail="Trade not found")
+
+    if trade.status not in (TradeStatus.FILLED, TradeStatus.STOP_LOSS_PLACED):
+        raise HTTPException(status_code=400, detail=f"Trade #{trade.id} is not active (status: {trade.status.value})")
+
+    if trade.entry_price is None:
+        raise HTTPException(status_code=400, detail=f"Trade #{trade.id} has no entry price")
+
+    schwab = get_schwab_service(request)
+
+    # Cancel existing stop-loss if present
+    if trade.stop_loss_order_id:
+        try:
+            schwab.cancel_order(trade.stop_loss_order_id)
+        except Exception:
+            pass
+        trade.stop_loss_order_id = None
+
+    # Place new stop-loss at per-trade or global config percent
+    sl_pct = trade.param_stop_loss_percent or settings.STOP_LOSS_PERCENT
+    stop_price = round(trade.entry_price * (1 - sl_pct / 100), 2)
+    remaining_qty = trade.entry_quantity - (trade.scaled_out_quantity or 0)
+    order = SchwabService.build_stop_loss_order(
+        option_symbol=trade.option_symbol,
+        quantity=remaining_qty,
+        stop_price=stop_price,
+    )
+    order_id = schwab.place_order(order)
+    trade.stop_loss_order_id = order_id
+    trade.stop_loss_price = stop_price
+    trade.status = TradeStatus.STOP_LOSS_PLACED
+    log_trade_event(
+        db, trade.id, TradeEventType.STOP_LOSS_PLACED,
+        f"Stop-loss re-placed at ${stop_price:.2f} ({sl_pct}% SL), order={order_id}",
+        details={"stop_price": stop_price, "order_id": order_id, "stop_loss_percent": sl_pct},
+    )
+    db.commit()
+
+    ws = get_ws_manager()
+    await ws.broadcast({
+        "event": "trade_stop_loss_replaced",
+        "data": {"trade_id": trade.id, "stop_loss_price": stop_price},
+    })
+
+    return {"status": "ok", "message": f"Trade #{trade.id} stop-loss set to ${stop_price:.2f} ({sl_pct}%)"}
 
 
 @router.post("/trades/{trade_id}/retake", response_model=WebhookResponse)

@@ -1,0 +1,1130 @@
+================================================================================
+                    DAYTRADER — FULL APPLICATION SPECIFICATION
+================================================================================
+
+DayTrader is an automated options day-trading platform built for 0DTE (zero days
+to expiration) SPY/QQQ options and weekly options on other tickers. It receives
+trading signals from TradingView webhooks or internally-generated strategies,
+selects optimal option contracts via a 7-factor scoring model, manages orders
+through the Schwab brokerage API, monitors positions with real-time streaming
+data, and exits trades using a priority-based exit engine with trailing stops,
+scale-outs, and dynamic parameter adaptation.
+
+The system comprises a FastAPI backend, a React + TypeScript frontend, a SQLite
+database, Schwab WebSocket streaming for real-time quotes, and a suite of
+backtesting/optimization scripts.
+
+
+================================================================================
+ 1. ARCHITECTURE OVERVIEW
+================================================================================
+
+  Frontend (React 18 + Vite)
+    │  Port 5173 (dev) or served from backend /assets (prod)
+    │
+    ├── WebSocket (/ws/dashboard)  ←──  Real-time trade events
+    ├── REST API  (/api/*)          ←──  CRUD, dashboard, backtest
+    │
+  Backend (FastAPI + Uvicorn)
+    │  Port 8000
+    │
+    ├── Background Tasks ──────────────────────────────────────────
+    │   ├── OrderMonitorTask     (polls every 5s)
+    │   ├── ExitMonitorTask      (polls every 10s)
+    │   ├── ORBSignalTask        (at market open, when active)
+    │   ├── StrategySignalTask   (1 per enabled strategy, polls 60s)
+    │   ├── EODCleanupTask       (once at 4:05 PM ET)
+    │   └── DataRecorderTask     (every 60s, optional)
+    │
+    ├── Schwab Streaming (WebSocket) ──────────────────────────────
+    │   ├── LEVELONE_OPTIONS  → option bid/ask/last/greeks
+    │   ├── LEVELONE_EQUITIES → SPY/QQQ/$VIX.X quotes
+    │   └── ACCT_ACTIVITY     → order fill notifications
+    │
+    ├── Schwab REST API ───────────────────────────────────────────
+    │   ├── Place/cancel orders
+    │   ├── Get order status
+    │   ├── Option chains
+    │   ├── Price history (intraday bars, daily OHLC)
+    │   └── Account info
+    │
+    └── SQLite Database (daytrader.db) ────────────────────────────
+        ├── alerts
+        ├── trades
+        ├── trade_events
+        ├── trade_price_snapshots
+        ├── daily_summaries
+        ├── option_chain_snapshots
+        ├── option_chain_contracts
+        └── favorite_strategies
+
+  External Integrations:
+    - Schwab API (schwabdev library, OAuth2)
+    - TradingView (webhook POST to /api/webhook)
+    - Ollama (local LLM for AI assistant)
+    - ngrok (optional, for TradingView webhook tunneling)
+
+
+================================================================================
+ 2. OPERATING MODES
+================================================================================
+
+  LIVE MODE       DRY_RUN=False, PAPER_TRADE=False
+                  Real orders placed on Schwab. Streaming enabled.
+
+  DRY RUN         DRY_RUN=True
+                  All logic runs but orders are simulated (not sent to Schwab).
+                  Streaming disabled. Good for validation.
+
+  PAPER TRADE     PAPER_TRADE=True
+                  Uses PaperSchwabClient mock. Simulates option chains, fills,
+                  and stops. Streaming disabled.
+
+
+================================================================================
+ 3. DATABASE SCHEMA
+================================================================================
+
+3.1  ENUMS
+----------
+
+  AlertStatus:      RECEIVED, ACCEPTED, REJECTED, PROCESSED, ERROR
+  TradeStatus:      PENDING, FILLED, STOP_LOSS_PLACED, EXITING, CLOSED,
+                    CANCELLED, ERROR
+  TradeDirection:   CALL, PUT
+  ExitReason:       STOP_LOSS, TRAILING_STOP, PROFIT_TARGET, MAX_HOLD_TIME,
+                    TIME_BASED, MANUAL, SIGNAL, EXPIRY
+  TradeEventType:   ALERT_RECEIVED, CONTRACT_SELECTED, ENTRY_ORDER_PLACED,
+                    ENTRY_FILLED, ENTRY_CANCELLED, STOP_LOSS_PLACED,
+                    STOP_LOSS_CANCELLED, EXIT_TRIGGERED, EXIT_ORDER_PLACED,
+                    EXIT_FILLED, STOP_LOSS_HIT, CLOSE_SIGNAL, MANUAL_CLOSE,
+                    SCALE_OUT, BREAKEVEN_STOP_MOVED, ENTRY_LIMIT_TIMEOUT
+
+3.2  TABLES
+-----------
+
+  alerts
+  ~~~~~~
+    id                  INTEGER PK
+    received_at         DATETIME (UTC)
+    raw_payload         TEXT (original JSON)
+    ticker              STRING(10)
+    direction           ENUM (CALL/PUT, nullable for CLOSE)
+    signal_price        FLOAT (underlying price at signal time)
+    source              STRING(20) — 'tradingview', 'orb_auto', 'strategy_signal',
+                        'test', 'retake'
+    status              ENUM AlertStatus
+    rejection_reason    STRING(255)
+    trade_id            FK → trades.id
+
+  trades
+  ~~~~~~
+    id                  INTEGER PK
+    trade_date          DATE
+    ticker              STRING(10), default 'SPY'
+    direction           ENUM TradeDirection
+    option_symbol       STRING(30) — e.g. "SPYW  260225C00600000"
+    strike_price        FLOAT
+    expiration_date     DATE
+
+    -- Entry --
+    entry_order_id      STRING(50) — Schwab order ID
+    entry_price         FLOAT — actual fill price
+    entry_quantity      INTEGER — number of contracts
+    entry_filled_at     DATETIME
+    alert_option_price  FLOAT — mid price at alert time
+    entry_is_fallback   BOOLEAN
+
+    -- Stop Loss --
+    stop_loss_order_id  STRING(50)
+    stop_loss_price     FLOAT
+
+    -- Trailing Stop --
+    trailing_stop_price FLOAT — current trailing stop level
+    highest_price_seen  FLOAT — watermark for trailing calc
+
+    -- Breakeven --
+    breakeven_stop_applied  BOOLEAN
+
+    -- Scale-Out --
+    scaled_out          BOOLEAN
+    scaled_out_quantity INTEGER
+    scaled_out_price    FLOAT
+    scaled_out_order_id STRING(50)
+    scale_out_count     INTEGER
+
+    -- Exit --
+    exit_order_id       STRING(50)
+    exit_price          FLOAT
+    exit_filled_at      DATETIME
+    exit_reason         ENUM ExitReason
+
+    -- Per-Trade Strategy Params (NULL = use global settings) --
+    param_stop_loss_percent       FLOAT
+    param_profit_target_percent   FLOAT
+    param_trailing_stop_percent   FLOAT
+    param_max_hold_minutes        INTEGER
+    entry_atr_value               FLOAT
+    param_atr_stop_mult           FLOAT
+    param_delta_target            FLOAT
+
+    -- Strategy Adapter Metadata --
+    entry_regime                  STRING(30) — breakout, trend_continuation, chop
+    entry_regime_confidence       FLOAT (0.0–1.0)
+    entry_vix                     FLOAT
+    adapter_applied               BOOLEAN
+
+    -- PnL --
+    pnl_dollars         FLOAT
+    pnl_percent         FLOAT
+    status              ENUM TradeStatus
+    source              STRING(20) — same values as alerts.source
+
+    created_at          DATETIME
+    updated_at          DATETIME
+
+  trade_events
+  ~~~~~~~~~~~~
+    id          INTEGER PK
+    trade_id    FK → trades.id (indexed)
+    timestamp   DATETIME
+    event_type  ENUM TradeEventType
+    message     STRING(500) — human-readable description
+    details     TEXT (JSON) — structured event data
+
+  trade_price_snapshots
+  ~~~~~~~~~~~~~~~~~~~~~
+    id                  INTEGER PK
+    trade_id            FK → trades.id
+    timestamp           DATETIME
+    price               FLOAT — option mid price
+    highest_price_seen  FLOAT
+    INDEX (trade_id, timestamp)
+
+  daily_summaries
+  ~~~~~~~~~~~~~~~
+    id                  INTEGER PK
+    trade_date          DATE (unique)
+    total_trades        INTEGER
+    winning_trades      INTEGER
+    losing_trades       INTEGER
+    total_pnl           FLOAT
+    largest_win         FLOAT
+    largest_loss        FLOAT
+    win_rate            FLOAT (0.0–1.0)
+    avg_hold_time_minutes  FLOAT
+    created_at          DATETIME
+
+  option_chain_snapshots
+  ~~~~~~~~~~~~~~~~~~~~~~
+    id                  INTEGER PK
+    snapshot_date       DATE (indexed)
+    snapshot_time       DATETIME (indexed)
+    underlying_symbol   STRING(10), default 'SPY'
+    underlying_price    FLOAT
+    created_at          DATETIME
+
+  option_chain_contracts
+  ~~~~~~~~~~~~~~~~~~~~~~
+    id              INTEGER PK
+    snapshot_id     FK → option_chain_snapshots.id (indexed)
+    option_symbol   STRING(30)
+    contract_type   ENUM TradeDirection
+    strike_price    FLOAT
+    expiration_date DATE
+    bid, ask, mid   FLOAT
+    delta           FLOAT (nullable)
+    open_interest   INTEGER (nullable)
+    volume          INTEGER (nullable)
+    INDEX (snapshot_id, contract_type)
+
+  favorite_strategies
+  ~~~~~~~~~~~~~~~~~~~
+    id              INTEGER PK
+    ticker          STRING(10) (indexed)
+    strategy_name   STRING(100)
+    direction       STRING(10)
+    params          TEXT (JSON)
+    summary         TEXT (JSON)
+    notes           TEXT
+    created_at      DATETIME
+
+
+================================================================================
+ 4. CONFIGURATION (backend/app/config.py)
+================================================================================
+
+All settings loaded from .env via Pydantic BaseSettings.
+
+  APPLICATION
+  ~~~~~~~~~~~
+    APP_NAME                        "DayTrader 0DTE"
+    DEBUG                           False
+    LOG_LEVEL                       "INFO"
+    PAPER_TRADE                     False
+    DRY_RUN                         True
+    DATABASE_URL                    "sqlite:///./daytrader.db"
+
+  SCHWAB API
+  ~~~~~~~~~~
+    SCHWAB_APP_KEY                  (required)
+    SCHWAB_APP_SECRET               (required)
+    SCHWAB_CALLBACK_URL             "https://127.0.0.1"
+    SCHWAB_TOKENS_DB                "~/.schwabdev/tokens.db"
+    SCHWAB_ACCOUNT_HASH             (auto-discovered if blank)
+
+  SCHWAB STREAMING (WebSocket)
+  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    STREAMING_ENABLED               True
+    STREAMING_STALE_SECONDS         30.0 — data older than this triggers REST fallback
+
+  WEBHOOK
+  ~~~~~~~
+    WEBHOOK_SECRET                  "change-me"
+    DEDUP_WINDOW_SECONDS            30
+
+  DAILY LIMITS
+  ~~~~~~~~~~~~
+    MAX_DAILY_TRADES                10
+    MAX_DAILY_LOSS                  700.0 ($)
+    MAX_CONSECUTIVE_LOSSES          3
+
+  ENTRY PARAMETERS
+  ~~~~~~~~~~~~~~~~
+    DEFAULT_QUANTITY                 2 (contracts)
+    ENTRY_LIMIT_BELOW_PERCENT       5.0 — limit order discount below mid
+    ENTRY_LIMIT_TIMEOUT_MINUTES     3.0 — cancel unfilled limit after this
+    TRADE_COOLDOWN_MINUTES          5
+    SIGNAL_DEBOUNCE_MINUTES         2
+    MIN_PRICE_RANGE                 0.50
+
+  ENTRY FILTERS
+  ~~~~~~~~~~~~~
+    MIN_OPTION_PRICE                1.00 — reject options cheaper than this
+    MIN_STOP_SPREAD_RATIO           2.0 — stop distance must be 2× spread
+
+  ATR-BASED STOPS
+  ~~~~~~~~~~~~~~~
+    ATR_STOP_ENABLED                True
+    ATR_PERIOD_DEFAULT              14
+    ATR_STOP_MULT_DEFAULT           2.0
+
+  POSITION SIZING
+  ~~~~~~~~~~~~~~~
+    MAX_RISK_PER_TRADE              300.0 ($)
+    Quantity = min(DEFAULT_QUANTITY, MAX_RISK / risk_per_contract)
+
+  ENTRY CONFIRMATION
+  ~~~~~~~~~~~~~~~~~~
+    ENTRY_CONFIRM_SECONDS           30 — delay before placing stop-loss
+    ENTRY_CONFIRM_EMERGENCY_PCT     15.0 — emergency exit if price drops >15%
+                                          during confirmation window
+
+  EXIT PARAMETERS
+  ~~~~~~~~~~~~~~~
+    STOP_LOSS_PERCENT               60.0
+    PROFIT_TARGET_PERCENT           40.0
+    TRAILING_STOP_PERCENT           20.0
+    TRAILING_STOP_ACTIVATION_PERCENT  15.0
+    TRAILING_STOP_AFTER_SCALE_OUT_PERCENT  10.0
+    MAX_HOLD_MINUTES                90
+    FORCE_EXIT_HOUR / MINUTE        15:30 ET (3:30 PM)
+    EXIT_MAX_SPREAD_PERCENT         30.0 — skip trailing check if spread > 30%
+
+  ENTRY WINDOWS
+  ~~~~~~~~~~~~~
+    FIRST_ENTRY_HOUR / MINUTE       10:00 ET
+    LAST_ENTRY_HOUR / MINUTE        14:45 ET (0DTE only; weeklies until force exit)
+    AFTERNOON_WINDOW_ENABLED        True
+
+  SCALE-OUT
+  ~~~~~~~~~
+    SCALE_OUT_ENABLED               True
+    BREAKEVEN_TRIGGER_PERCENT       10.0
+    SCALE_OUT_TIER_1_PERCENT        20.0 / SCALE_OUT_TIER_1_QTY  10%
+    SCALE_OUT_TIER_2_PERCENT        40.0 / SCALE_OUT_TIER_2_QTY  8%
+
+  OPTION SELECTION
+  ~~~~~~~~~~~~~~~~
+    OPTION_DELTA_TARGET             0.40 — target absolute delta
+    OPTION_MAX_SPREAD_PERCENT       10.0 — reject wide-spread options
+    DYNAMIC_DELTA_ENABLED           True — adjust delta by regime/VIX/time
+    IV_RANK_MAX                     70.0 — reject when IV Rank >= 70%
+
+  STRATEGY
+  ~~~~~~~~
+    ACTIVE_STRATEGY                 "orb_auto" | "tradingview" | "disabled"
+    STRATEGY_ADAPTER_ENABLED        True — dynamic stop/target adjustment
+    ORB_MIN_RANGE                   0.30
+    ORB_POLL_INTERVAL_SECONDS       30
+
+  MONITORING INTERVALS
+  ~~~~~~~~~~~~~~~~~~~~
+    ORDER_POLL_INTERVAL_SECONDS     5
+    EXIT_CHECK_INTERVAL_SECONDS     10
+
+  DATA RECORDER (Optional)
+  ~~~~~~~~~~~~~~~~~~~~~~~~
+    DATA_RECORDER_ENABLED           False
+    DATA_RECORDER_INTERVAL_SECONDS  60
+    DATA_RECORDER_STRIKE_COUNT      20
+
+  AI ASSISTANT
+  ~~~~~~~~~~~~
+    OLLAMA_URL                      "http://localhost:11434"
+    OLLAMA_MODEL                    "llama3.1:8b"
+
+  CORS
+  ~~~~
+    CORS_ORIGINS                    ["http://localhost:5173"]
+
+
+================================================================================
+ 5. TRADE LIFECYCLE
+================================================================================
+
+5.1  SIGNAL SOURCES
+-------------------
+
+  a) TradingView Webhook (POST /api/webhook)
+     - External signal from TradingView Pine Script alerts
+     - Payload: { ticker, action, secret, price, comment, source }
+     - source = "tradingview" (default when omitted)
+
+  b) ORB Auto Strategy (ORBSignalTask)
+     - Built-in Opening Range Breakout strategy
+     - Fetches 9:30–9:45 AM opening range
+     - Waits for 9:50 AM confirmation
+     - Fires BUY_CALL (breakout up) or BUY_PUT (breakout down)
+     - source = "orb_auto"
+
+  c) Strategy Signal (StrategySignalTask)
+     - Per-strategy live signal polling
+     - Fetches intraday bars, runs _generate_signals() from backtest engine
+     - Supports 10 signal types (see §5.2)
+     - source = "strategy_signal"
+
+  d) Manual / Test (Testing page or API)
+     - Direct API call with source = "test"
+
+  e) Retake (from closed/cancelled trade)
+     - Re-enters same direction with fresh contract
+     - source = "retake"
+
+5.2  SIGNAL TYPES
+-----------------
+
+  ema_cross         EMA fast/slow crossover (8/21 default)
+  vwap_cross        Price crosses VWAP with volume confirmation
+  ema_vwap          EMA cross + price above/below VWAP
+  orb               Opening Range Breakout (price breaks high/low of first N min)
+  orb_direction     ORB with directional bias (range body > threshold)
+  vwap_rsi          VWAP + RSI overbought/oversold
+  vwap_reclaim      Price reclaims VWAP after pullback
+  bb_squeeze        Bollinger Band width contracts then expands
+  rsi_reversal      RSI crosses back from extreme levels
+  confluence        Multi-indicator agreement (weighted scoring: EMA, VWAP, RSI,
+                    BB, MACD, volume, ATR, pivot proximity)
+
+5.3  ENTRY FLOW
+---------------
+
+  Signal arrives → TradeManager.process_alert():
+
+  1. TIME WINDOW CHECK
+     - Before FIRST_ENTRY_HOUR:MINUTE → reject
+     - After LAST_ENTRY_HOUR:MINUTE (0DTE) or FORCE_EXIT (weekly) → reject
+
+  2. DAILY LIMITS
+     - Trade count >= MAX_DAILY_TRADES → reject
+     - Daily P&L <= -MAX_DAILY_LOSS → reject
+     - Consecutive losses >= MAX_CONSECUTIVE_LOSSES → reject (signal-based only)
+
+  3. COOLDOWN & DEDUP
+     - Same ticker traded within TRADE_COOLDOWN_MINUTES → reject
+     - Same ticker already has open position → reject
+     - Opposite direction alert within SIGNAL_DEBOUNCE_MINUTES → reject
+
+  4. VOLATILITY FILTER
+     - Signal prices in last 5 min have < MIN_PRICE_RANGE range → reject
+
+  5. EXISTING POSITION HANDLING
+     - Same direction open → reject
+     - Opposite direction open → close existing, then proceed (reverse)
+
+  6. DYNAMIC DELTA RESOLUTION (if DYNAMIC_DELTA_ENABLED)
+     - Classify market regime (breakout / trend_continuation / chop)
+     - Compute expected move from ATR × √(hold_bars)
+     - Get VIX level (streaming-first, REST fallback)
+     - Check time-of-day (late day >= 2 PM ET)
+     - Blend 4 factors: regime 40%, expected_move 30%, VIX 20%, time 10%
+     - Clamp result to [0.20, 0.80]
+
+  7. STRATEGY ADAPTATION (if STRATEGY_ADAPTER_ENABLED)
+     - Apply regime multipliers to SL, PT, trailing stop, max hold
+     - Apply VIX overlay (high VIX: wider stops, less risk)
+     - Apply confidence scaling (low confidence: reduce risk)
+     - Clamp all values to safe ranges
+
+  8. OPTION CONTRACT SELECTION (OptionSelector)
+     - Fetch 0DTE chain (SPY/QQQ) or nearest weekly (other tickers)
+     - Hard filters: bid/ask > 0, mid >= $1.00, spread <= 10%, volume >= 10,
+       OI >= 500, IV <= 150%, correct delta sign
+     - IV Rank filter: reject if IV Rank >= IV_RANK_MAX (70%)
+     - 7-factor weighted scoring:
+         Delta proximity     35%
+         Expected move        25%
+         Spread tightness    15%
+         Theta efficiency    10%
+         Liquidity            5%
+         Gamma efficiency     5%
+         Flow signal          5%
+
+  9. SPREAD VIABILITY CHECK
+     - Stop distance must be >= MIN_STOP_SPREAD_RATIO × bid-ask spread
+
+ 10. POSITION SIZING
+     - ATR-based: risk = ATR × mult × delta × 100
+     - Percent-based: risk = mid × SL% / 100 × 100
+     - Quantity = min(DEFAULT_QUANTITY, MAX_RISK / risk_per_contract)
+
+ 11. ENTRY ORDER
+     - MARKET order: if market_order_override enabled
+     - LIMIT order: mid × (1 - ENTRY_LIMIT_BELOW_PERCENT/100)
+     - Timeout: ENTRY_LIMIT_TIMEOUT_MINUTES
+
+ 12. TRADE RECORD CREATED
+     - Status: PENDING
+     - All strategy params, ATR data, delta target, regime metadata stored
+
+5.4  ORDER MONITORING (OrderMonitorTask, every 5s)
+--------------------------------------------------
+
+  For PENDING trades:
+    - Record price snapshots (option mid) for post-analysis
+    - Subscribe to option symbol via streaming
+    - Poll Schwab for entry order status:
+      • FILLED → update entry_price, entry_filled_at
+                  compute stop_loss_price (ATR-based or percent-based)
+                  status → FILLED (stop placed after ENTRY_CONFIRM_SECONDS delay)
+      • CANCELED/REJECTED/EXPIRED → status → CANCELLED
+      • Entry timeout → cancel order, status → CANCELLED
+
+  For EXITING trades:
+    - Poll exit order status:
+      • FILLED → compute PnL, update exit_price, exit_filled_at
+                  status → CLOSED
+
+  For FILLED / STOP_LOSS_PLACED trades:
+    - Check if Schwab stop-loss order triggered:
+      • FILLED → compute PnL, status → CLOSED, exit_reason → STOP_LOSS
+
+5.5  EXIT MONITORING (ExitMonitorTask, every 10s)
+-------------------------------------------------
+
+  For each FILLED / STOP_LOSS_PLACED trade, ExitEngine evaluates in priority:
+
+  1. FORCE EXIT (TIME_BASED)
+     - Current time >= FORCE_EXIT_HOUR:MINUTE → market sell immediately
+
+  2. MAX HOLD TIME (MAX_HOLD_TIME)
+     - Minutes since entry > param_max_hold_minutes (or MAX_HOLD_MINUTES)
+
+  3. APP-MANAGED STOP LOSS (STOP_LOSS)
+     - Fallback if Schwab stop order failed
+     - Current bid <= stop_loss_price
+
+  4. PROFIT TARGET (PROFIT_TARGET)
+     - Current PnL% >= param_profit_target_percent (or PROFIT_TARGET_PERCENT)
+     - If SCALE_OUT_ENABLED:
+       Tier 1: PnL >= SCALE_OUT_TIER_1_PERCENT → sell 10% of position
+       Tier 2: PnL >= SCALE_OUT_TIER_2_PERCENT → sell 8% of position
+     - Full exit at profit target
+
+  5. TRAILING STOP (TRAILING_STOP)
+     - Activates after TRAILING_STOP_ACTIVATION_PERCENT gain
+     - Tracks highest_price_seen (bid-based)
+     - Trail distance = highest × param_trailing_stop_percent / 100
+     - Tighter after scale-out: TRAILING_STOP_AFTER_SCALE_OUT_PERCENT
+     - Skipped if current spread > EXIT_MAX_SPREAD_PERCENT
+
+  6. BREAKEVEN STOP
+     - After BREAKEVEN_TRIGGER_PERCENT gain:
+       Move stop-loss to entry_price (cancel old, place new)
+
+  Price updates each cycle:
+    - Update highest_price_seen
+    - Record TradePriceSnapshot
+    - Update trailing_stop_price
+
+5.6  STATE TRANSITIONS
+----------------------
+
+  PENDING → FILLED           (entry order fills)
+  PENDING → CANCELLED        (entry timeout, order cancelled/rejected)
+  FILLED → STOP_LOSS_PLACED  (stop-loss order placed after confirmation delay)
+  FILLED → EXITING           (exit condition met before SL placed)
+  STOP_LOSS_PLACED → EXITING (exit condition met)
+  STOP_LOSS_PLACED → CLOSED  (stop-loss order fills on Schwab)
+  EXITING → CLOSED           (exit order fills)
+  Any → ERROR                (unrecoverable error)
+
+
+================================================================================
+ 6. SCHWAB STREAMING SERVICE (backend/app/services/streaming.py)
+================================================================================
+
+Central WebSocket service wrapping schwabdev.StreamAsync.
+
+  STARTUP:
+    StreamAsync(schwab_client) → start(receiver=_on_message)
+    Auto-subscribe: SPY, QQQ, $VIX.X (equities)
+    Auto-subscribe: account activity
+
+  SUBSCRIPTIONS:
+    subscribe_option(symbol)     — dynamic per-trade lifecycle
+    unsubscribe_option(symbol)   — when trade closes
+    subscribe_equity(symbol)     — always-on for key symbols
+    subscribe_account_activity() — order fill logging
+
+  QUOTE CACHE:
+    QuoteSnapshot dataclass per symbol:
+      bid, ask, last, high, low, close, volume, OI, IV,
+      delta, gamma, theta, vega, updated_at
+      Properties: mid, spread_pct, is_stale (>30s)
+
+    get_option_quote(symbol) → QuoteSnapshot or None (if stale)
+    get_equity_quote(symbol) → QuoteSnapshot or None (if stale)
+
+  STREAMING DATA FORMAT:
+    Options: fields 0,2,3,4,5,6,7,8,9,10,28,29,30,31
+             (Symbol, Bid, Ask, Last, High, Low, Close, Volume, OI, IV,
+              Delta, Gamma, Theta, Vega)
+    Equities: fields 0,1,2,3,8
+              (Symbol, Bid, Ask, Last, Volume)
+    Delta updates: only fields present in message are updated
+
+  CONSUMERS (streaming-first, REST fallback):
+    - ExitEngine._get_price_data() → streaming option quote
+    - OrderManager._get_current_mid() → streaming option quote
+    - ORBSignalTask._get_spy_price() → streaming equity quote
+    - TradeManager._resolve_delta() → streaming VIX quote ($VIX.X)
+
+  DISABLED WHEN: DRY_RUN=True, PAPER_TRADE=True, STREAMING_ENABLED=False
+  AUTO-RECONNECT: schwabdev handles reconnection with exponential backoff;
+                  subscriptions replayed automatically on reconnect
+
+
+================================================================================
+ 7. MARKET REGIME & DYNAMIC DELTA
+================================================================================
+
+7.1  REGIME CLASSIFIER (regime_classifier.py)
+---------------------------------------------
+
+  Signal → Initial Regime mapping:
+    orb, orb_direction, bb_squeeze     → BREAKOUT
+    ema_cross, vwap_cross, ema_vwap,
+    confluence, vwap_reclaim           → TREND_CONTINUATION
+    rsi_reversal, vwap_rsi            → CHOP
+
+  Validation using market data (ADX, ATR, EMA9/21, VWAP):
+    BREAKOUT:           compression (5-bar range < ATR) AND expansion (price > 0.5 ATR from VWAP)
+    TREND_CONTINUATION: ADX >= 18 AND EMA distance > 0.2 × ATR
+    CHOP:               ADX < 18
+
+  Confidence = (ADX>25: 30) + (expansion: 25) + (structured: 25) + (compression: 20) / 100
+
+7.2  DELTA RESOLVER (delta_resolver.py)
+---------------------------------------
+
+  4-factor blended delta target:
+
+    Factor          Weight   Logic
+    ─────────────   ──────   ─────
+    Regime          40%      BREAKOUT: 0.50-0.65, TREND: 0.40-0.55, CHOP: 0.25-0.40
+    Expected Move   30%      ATR × √(hold_bars/5): small→0.30-0.40, large→0.55-0.70
+    VIX Level       20%      High(>25): 0.35-0.50, Low(<15): 0.50-0.70, Neutral: skip
+    Time of Day     10%      Late(>=2PM): 0.60-0.75, Otherwise: skip
+
+  Inactive factors redistribute weight proportionally.
+  Final delta clamped to [0.20, 0.80].
+
+7.3  STRATEGY ADAPTER (strategy_adapter.py)
+-------------------------------------------
+
+  Adjusts trade parameters based on regime and VIX:
+
+  Regime Multipliers:
+                    Stop    Target  Trail   Hold
+    BREAKOUT        1.3×    1.5×    1.2×    1.2×
+    TREND_CONT      1.0×    1.0×    1.0×    1.0×
+    CHOP            0.7×    0.6×    0.7×    0.6×
+
+  VIX Overlay (multiplicative on stops/targets):
+    High (>25):    × 1.3,  max_risk × 0.7
+    Low  (<15):    × 0.8
+    Neutral:       no change
+
+  Confidence Scaling (risk only):
+    Low (<0.4):    max_risk × 0.5
+
+  Clamping Ranges:
+    SL: 5–95%, PT: 5–200%, Trail: 3–50%, Hold: 10–360 min
+
+
+================================================================================
+ 8. OPTION CONTRACT SELECTION (option_selector.py)
+================================================================================
+
+  CHAIN SELECTION:
+    0DTE tickers (SPY, QQQ): today's expiration
+    Other tickers: nearest Friday (weekly) expiration
+
+  HARD FILTERS (all must pass):
+    - bid > 0, ask > 0
+    - mid >= MIN_OPTION_PRICE ($1.00)
+    - spread% <= OPTION_MAX_SPREAD_PERCENT (10%)
+    - volume >= 10
+    - open_interest >= 500
+    - IV <= 150%
+    - delta sign matches direction (+ for calls, - for puts)
+
+  IV RANK FILTER:
+    Compute IV Rank from historical IV (252-day look-back)
+    Reject trade if IV Rank >= IV_RANK_MAX (70%)
+    Raises IVRankTooHighError
+
+  7-FACTOR WEIGHTED SCORING:
+    Factor              Weight    Best Score When
+    ──────              ──────    ───────────────
+    Delta proximity     35%       |delta - target| is smallest
+    Expected move       25%       Strike captures max expected move
+    Spread tightness    15%       Bid-ask spread is narrowest
+    Theta efficiency    10%       Best theta-to-price ratio
+    Liquidity            5%       Highest volume + OI
+    Gamma efficiency     5%       Best gamma-to-price ratio
+    Flow signal          5%       Volume/OI ratio indicates activity
+
+  Winner: highest composite score contract
+
+
+================================================================================
+ 9. BACKEND API ENDPOINTS
+================================================================================
+
+9.1  WEBHOOK
+  POST /api/webhook
+    Receive TradingView or strategy signal.
+    Body: { ticker, action, secret, price?, comment?, source? }
+    Response: { status, message, trade_id? }
+
+9.2  TRADES
+  GET  /api/trades                  Paginated list (date, status, ticker filters)
+  GET  /api/trades/tickers          Distinct tickers with trades
+  GET  /api/trades/open/quotes      Live bid/ask/last for open positions
+  GET  /api/trades/{id}             Single trade details
+  GET  /api/trades/{id}/events      Trade event timeline
+  GET  /api/trades/{id}/prices      Price snapshots during trade
+  POST /api/trades/{id}/close       Force-close trade (MANUAL exit)
+  POST /api/trades/{id}/cancel      Cancel pending entry order
+  POST /api/trades/{id}/cancel-stop-loss    Remove stop-loss order
+  POST /api/trades/{id}/replace-stop-loss   Re-place stop-loss at current %
+  POST /api/trades/{id}/retake      Re-enter same direction, fresh contract
+
+9.3  DASHBOARD
+  GET  /api/dashboard/stats         Daily stats (PnL, win rate, counts)
+  GET  /api/dashboard/pnl           P&L data points for chart
+  GET  /api/dashboard/pnl-summary   Weekly/monthly P&L breakdown
+  GET  /api/dashboard/spy-price     Current SPY quote
+  GET  /api/dashboard/strategy      Active strategy name
+  GET  /api/dashboard/mode          Paper/live mode status
+  PUT  /api/dashboard/mode          Update mode (requires restart)
+  GET  /api/dashboard/window-override   Trading window override flag
+  PUT  /api/dashboard/window-override   Toggle window override
+  GET  /api/dashboard/market-order-override   Market vs limit order mode
+  PUT  /api/dashboard/market-order-override   Toggle order mode
+  GET  /api/dashboard/ngrok         ngrok tunnel status
+  GET  /api/dashboard/token-status  Schwab token expiry info
+  GET  /api/dashboard/candles       Intraday OHLCV candle data
+  GET  /api/dashboard/pivots        Classic pivot points (P, R1, R2, S1, S2)
+  GET  /api/dashboard/analytics     Analytics by hour/strategy/weekday/hold time
+  GET  /api/dashboard/chart-markers Signal + entry/exit markers for chart
+
+9.4  ALERTS
+  GET  /api/alerts                  Paginated alert history (date, status filters)
+
+9.5  AUTH
+  GET  /api/auth/status             OAuth status + authorization URL
+
+9.6  BACKTEST (SPY 0DTE)
+  POST /api/backtest/run            Run backtest with full parameter set
+  POST /api/backtest/optimize       Random-search parameter optimization
+
+9.7  STOCK BACKTEST (Multi-Ticker)
+  GET  /api/stock-backtest/tiers    Market cap tier counts
+  GET  /api/stock-backtest/tickers  Available tickers with data files
+  POST /api/stock-backtest/run      Single-ticker backtest
+  POST /api/stock-backtest/optimize Single-ticker optimization
+  GET  /api/stock-backtest/results  Saved batch results
+  POST /api/stock-backtest/batch-optimize   Start async batch optimization
+  GET  /api/stock-backtest/batch-optimize/status  Poll batch progress
+  POST /api/stock-backtest/search   Symbol search
+  POST /api/stock-backtest/download/{symbol}  Download 6 months data
+  GET  /api/stock-backtest/favorites    Saved favorite strategies
+  POST /api/stock-backtest/favorites    Save favorite
+  DELETE /api/stock-backtest/favorites/{id}  Delete favorite
+
+9.8  STRATEGIES
+  GET  /api/strategies/enabled      List enabled strategies
+  POST /api/strategies/enable       Enable strategy (starts background task)
+  POST /api/strategies/disable      Disable strategy (cancels task)
+
+9.9  ASSISTANT
+  POST /api/assistant/chat          Chat with local Ollama LLM
+    Body: { messages: [{ role, content }] }
+    Context includes: today's trades, recent closed trades, weekly stats,
+                      enabled strategies, referenced trade details
+
+9.10 TESTING
+  POST /api/testing/close-trade     Manually close trade at specified PnL%
+
+9.11 SNAPSHOTS
+  GET    /api/snapshots/stats/summary  Recording statistics
+  GET    /api/snapshots                List snapshots (paginated)
+  GET    /api/snapshots/{id}           Snapshot details with contracts
+  DELETE /api/snapshots/date/{date}    Delete snapshots by date
+
+9.12 WEBSOCKET
+  WS /ws/dashboard                   Real-time trade event stream
+    Events: trade_created, trade_filled, trade_closed, trade_cancelled,
+            stop_loss_placed, stop_loss_cancelled, stop_loss_replaced,
+            exit_triggered, scale_out
+
+
+================================================================================
+10. BACKGROUND TASKS
+================================================================================
+
+  TASK                  INTERVAL        WHAT IT DOES
+  ─────                 ────────        ────────────
+  OrderMonitorTask      5 sec           Polls entry/exit/SL order fills. Records
+                                        price snapshots. Manages streaming
+                                        subscriptions for pending trades.
+
+  ExitMonitorTask       10 sec          Evaluates exit conditions (force exit,
+                                        max hold, SL, PT, trailing stop,
+                                        breakeven). Places exit orders. Manages
+                                        streaming subscriptions for active trades.
+
+  ORBSignalTask         30 sec          Opening Range Breakout strategy. Fetches
+                                        9:30-9:45 range, waits for 9:50 confirm,
+                                        fires signal if breakout detected.
+
+  StrategySignalTask    60 sec          One instance per enabled strategy. Fetches
+                                        intraday bars, runs signal generator, fires
+                                        new signals through TradeManager.
+
+  EODCleanupTask        Once at         Computes DailySummary at market close.
+                        4:05 PM ET      Aggregates wins, losses, PnL, hold times.
+
+  DataRecorderTask      60 sec          Records option chain snapshots during
+  (optional)                            market hours for backtesting.
+
+
+================================================================================
+11. FRONTEND PAGES & COMPONENTS
+================================================================================
+
+11.1 ROUTING (App.tsx)
+----------------------
+
+  /           → Dashboard (main trading page)
+  /history    → Trade History
+  /alerts     → Signals / Alerts History
+  /setups     → Top Setups (optimization results)
+
+  Global elements:
+  - Navigation bar with links, theme toggle, token/ngrok status, mode badge
+  - Floating chat button → ChatDrawer (AI assistant)
+
+11.2 DASHBOARD PAGE
+-------------------
+
+  Top bar:
+    - Date navigation (prev/next day, today button)
+    - Trading window labels (Morning 9:45-11:15, Afternoon 12:45-14:50)
+    - Bypass trading windows toggle
+    - Market/Limit order mode toggle
+    - WebSocket connection status indicator
+
+  Strategy cards:
+    - Grid of enabled strategies (ticker, timeframe, signal type, params)
+    - Click to select and focus chart on that ticker
+
+  Daily stats bar:
+    - Total P&L (large hero number, green/red)
+    - Win/Loss count, win rate
+    - Remaining trades allowed
+    - Open positions count
+
+  Candlestick chart:
+    - Lightweight Charts library
+    - 5-min (or strategy-configured) candles with volume
+    - Entry/exit markers with color coding
+    - Signal markers (triangles)
+    - Pivot levels (P, R1, R2, S1, S2) as price lines
+
+  Open positions:
+    - Each position shows: direction, strike, status, entry/current price,
+      unrealized P&L, stop/trailing levels
+    - Close button (FILLED+) or Cancel Entry button (PENDING)
+    - Auto-refreshes quotes every 5 seconds during market hours
+
+  P&L chart:
+    - Tabs: Daily (area chart), Weekly (bar chart), Monthly (bar chart)
+    - Reference line at zero
+
+  Analytics (if trades exist):
+    - Period selector: 7d, 14d, 30d, 90d
+    - Win/loss streak
+    - By hour: P&L per hour of day (9 AM - 3 PM)
+    - By strategy: P&L per signal type with profit factor
+    - By day of week: P&L per weekday
+    - By hold time: Win rate vs duration buckets
+
+  Recent trades table:
+    - Compact table with expandable rows
+    - Retake button for closed/cancelled trades
+
+11.3 TRADE HISTORY PAGE
+------------------------
+
+  - Full trade list with pagination (25 per page)
+  - Filters: date, ticker (dropdown), status
+  - TradeTable component with expandable rows showing:
+    - TradeActivityLog (event timeline with vertical connector)
+    - TradePriceChart (line chart of option price during trade)
+    - Retake button
+
+11.4 ALERTS HISTORY PAGE
+-------------------------
+
+  - Paginated alert list (25 per page)
+  - Filters: date, status, "trading window only" toggle
+  - AlertTable with source badges:
+    TradingView (sky blue), Strategy (emerald), ORB Auto (amber),
+    Test (purple), Retake (default)
+  - Expandable raw JSON payload
+
+11.5 TOP SETUPS PAGE
+---------------------
+
+  Batch optimization controls:
+    - Iterations, metric, market cap filter, ticker multi-select, min trades
+    - Run button with progress indicator (status polling every 2s)
+
+  Results summary:
+    - Grid of top ticker cards (best P&L per ticker)
+    - Click to filter table
+
+  Results table (sortable):
+    - Columns: Ticker, Timeframe, Signal, IS P&L, Trades, Win Rate, PF,
+      MaxDD, IS Score, OOS P&L, OOS PF, MC Confidence
+    - Actions per row: favorite, drill down, enable/disable strategy
+    - "Enabled Only" filter toggle
+
+  Drill-down backtest view:
+    - Full strategy description (entry/exit logic)
+    - Parameter badges
+    - Summary cards: P&L, Win Rate, Trades, PF, MaxDD, Contracts, Capital, Hold
+    - Daily P&L bar chart
+    - Exit reasons breakdown
+    - Full trades table
+
+11.6 COMPONENTS
+---------------
+
+  TradeTable          Reusable trade list with Signal/Manual source filter
+  AlertTable          Alert list with source badges and expandable payload
+  DailyStats          Hero P&L + win/loss stats bar
+  PnLChart            Recharts area/bar chart for P&L visualization
+  OpenPositions       Live positions with quote refresh
+  CandlestickChart    Lightweight Charts candlestick + volume + markers + pivots
+  StrategyCards       Grid of enabled strategy cards
+  TradeActivityLog    Event timeline with vertical dots and connector
+  TradePriceChart     Line chart of option price during trade
+  ChatDrawer          Right sidebar AI chat panel
+
+11.7 REAL-TIME FEATURES
+------------------------
+
+  WebSocket (useWebSocket hook):
+    - Connects to /ws/dashboard
+    - Auto-reconnects every 3 seconds on disconnect
+    - Triggers UI refresh on trade events
+
+  Auto-refresh:
+    - Dashboard stats/charts: every 30s during market hours
+    - Open positions quotes: every 5s during market hours
+    - Analytics/candles: every 60s
+
+
+================================================================================
+12. BACKTESTING & OPTIMIZATION
+================================================================================
+
+12.1 SPY 0DTE BACKTEST (backend/app/services/backtest/)
+------------------------------------------------------
+
+  Engine (engine.py):
+    - Loads intraday bars from CSV or yfinance
+    - Generates signals using configurable strategies (10 types)
+    - Simulates trade lifecycle with entry/exit rules
+    - Computes PnL, win rate, Sharpe, profit factor, max drawdown
+    - Supports pivot levels (prior day H/L/C)
+
+  Optimizer (optimizer.py):
+    - Random search across 30+ parameter dimensions
+    - Walk-forward split (train 80% → test 20%)
+    - Metrics: total_pnl, profit_factor, win_rate, composite, risk_adjusted, sharpe
+    - Returns top N parameter sets
+
+  Market Data (market_data.py):
+    - BarData class: timestamp, open, high, low, close, volume
+    - CSV loader with market hours filtering
+    - VIX daily data loader
+
+  Black-Scholes (black_scholes.py):
+    - Option pricing at target delta
+    - Strike selection for given delta target
+
+  Spread Model (spread_model.py):
+    - Dynamic bid-ask spread estimation
+    - Calibrated to SPY 0DTE data by liquidity tier
+
+12.2 MULTI-TICKER STOCK BACKTEST (scripts/stock_backtest_engine.py)
+------------------------------------------------------------------
+
+  - Options-level backtest for any ticker
+  - Black-Scholes pricing with historical volatility
+  - Strike selection at target delta
+  - Liquidity tiers: Tier 1 (SPY/QQQ), Tier 2 (mega caps), Tier 3 (others)
+  - 0DTE for SPY/QQQ, weekly (Friday expiry) for other tickers
+  - VIX regime filtering
+
+12.3 OPTIMIZATION SCRIPTS
+--------------------------
+
+  multi_ticker_optimizer.py:  200 iterations per ticker×timeframe, 10 signal types
+  sp500_scanner.py:           Download + optimize across all S&P 500 stocks
+  comprehensive_scan.py:      20 curated strategy configs across all tickers
+
+
+================================================================================
+13. SCRIPTS
+================================================================================
+
+  DATA FETCHING:
+    spy_schwab_fetcher.py       6 months SPY data from Schwab (1/5/10/15/30 min)
+    multi_ticker_fetcher.py     14 tickers in parallel (multi-threaded)
+    schwab_fetcher.py           Single-ticker on-demand fetcher (called from API)
+    spy_data_fetcher.py         SPY data from yfinance (limited history)
+
+  ANALYSIS:
+    spy_pattern_analysis.py     Pattern analysis (ORB, VWAP, RSI, BB, confluence)
+    spy_stoploss_comparison.py  Stop-loss percentage backtesting (8-30%)
+    comprehensive_scan.py       20 strategy configs across all downloaded tickers
+    multi_ticker_optimizer.py   Full parameter optimization across tickers
+    sp500_scanner.py            S&P 500 scan (download + optimize all)
+    stock_backtest_engine.py    Core multi-ticker backtest engine
+
+  PINE SCRIPTS:
+    orb_strategy.pine           TradingView ORB indicator
+    confluence_strategy.pine    TradingView multi-indicator confluence
+
+
+================================================================================
+14. DATA FILES
+================================================================================
+
+  data/
+  ├── SPY/                        SPY OHLCV (1/5/10/15/30 min, ~6 months each)
+  ├── QQQ/                        QQQ OHLCV (same structure)
+  ├── {TICKER}/                   Per-ticker OHLCV directories
+  │   └── {TICKER}_{freq}min_6months.csv
+  ├── VIX_daily.csv               Daily VIX close values
+  ├── enabled_strategies.json     Active strategy configurations
+  ├── optimization_results.json   Best backtest results per ticker
+  ├── comprehensive_scan_results.json  Full scan results (~25 MB)
+  └── sp500_tickers.txt           S&P 500 constituent list
+
+  CSV Format:
+    Date, Time, Timestamp, Open, High, Low, Close, Volume
+    2026-01-05, 09:30:00, 2026-01-05 09:30:00, 686.54, 687.39, 686.38, 687.28, 1248990
+
+
+================================================================================
+15. DEPENDENCIES
+================================================================================
+
+  BACKEND (Python):
+    fastapi >= 0.100.0          Web framework
+    uvicorn[standard] >= 0.23.0 ASGI server
+    sqlalchemy >= 2.0.0         ORM
+    pydantic >= 2.0.0           Validation
+    schwabdev                   Schwab API + streaming (v3.0.1)
+    httpx >= 0.24.0             HTTP client
+    websockets >= 11.0          WebSocket support
+    pandas >= 2.0.0             Data processing
+    numpy                       Numerical computation
+    yfinance >= 0.2.0           Yahoo Finance data
+    scipy                       Black-Scholes calculations
+    openpyxl                    Excel file support
+    pytest >= 7.0.0             Testing
+
+  FRONTEND (Node.js):
+    react 18.3.0                UI framework
+    react-dom 18.3.0            DOM rendering
+    react-router-dom 6.26.0     Client-side routing
+    axios 1.7.0                 HTTP client
+    recharts 2.12.0             Charts (P&L, analytics)
+    lightweight-charts 5.1.0    Candlestick charts
+    tailwindcss 4.0.0           Utility CSS
+    typescript 5.5.0            Type safety
+    vite 5.4.0                  Build tool
+
+
+================================================================================
+16. DEPLOYMENT
+================================================================================
+
+  PREREQUISITES:
+    Python 3.10+, Node.js 18+, Schwab developer account
+
+  BACKEND:
+    cd backend
+    cp .env.example .env          # Edit with credentials
+    python -m venv .venv
+    source .venv/bin/activate
+    pip install -r requirements.txt
+    python -m scripts.auth_setup  # One-time Schwab OAuth login
+    uvicorn app.main:app --host 0.0.0.0 --port 8000
+
+  FRONTEND (Development):
+    cd frontend
+    npm install
+    npm run dev                   # Vite dev server on :5173
+
+  FRONTEND (Production):
+    cd frontend
+    npm run build                 # Build to frontend/dist/
+    # Backend serves frontend/dist/ as static files
+
+  TUNNELING (for TradingView webhooks):
+    ngrok http 8000               # Expose backend to internet
+
+  DATABASE:
+    Auto-created on first startup via SQLAlchemy create_all().
+    Safe column migrations run on each startup (ALTER TABLE with try/except).
+    No migration framework — schema changes are additive only.

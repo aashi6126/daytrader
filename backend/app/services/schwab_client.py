@@ -134,7 +134,8 @@ class SchwabService:
             fill_price = float(
                 order.get("price")
                 or order.get("stopPrice")
-                or "0"
+                or order.get("_sim_price")
+                or "1.00"
             )
             logger.info(f"[DRY RUN] Order {order_id} status → FILLED at {fill_price}")
             return {
@@ -168,6 +169,45 @@ class SchwabService:
         resp.raise_for_status()
         return resp.json()
 
+    def get_vix(self) -> Optional[float]:
+        """Fetch current VIX level from Schwab quotes."""
+        try:
+            data = self.get_quote("$VIX.X")
+            vix = data.get("$VIX.X", {}).get("quote", {}).get("lastPrice")
+            if vix is not None:
+                logger.info(f"Current VIX: {vix:.2f}")
+                return float(vix)
+            logger.warning("VIX quote returned no lastPrice")
+            return None
+        except Exception as e:
+            logger.warning(f"Failed to fetch VIX: {e}")
+            return None
+
+    def fetch_intraday_bars(self, ticker: str, frequency: int = 5) -> list[dict]:
+        """Fetch today's intraday candles for ATR computation."""
+        resp = self.client.price_history(
+            ticker,
+            periodType="day",
+            period="1",
+            frequencyType="minute",
+            frequency=frequency,
+            needExtendedHoursData=False,
+        )
+        resp.raise_for_status()
+        return resp.json().get("candles", [])
+
+    def fetch_daily_bars(self, ticker: str, period_months: int = 12) -> list[dict]:
+        """Fetch daily candles for historical volatility / IV rank computation."""
+        resp = self.client.price_history(
+            ticker,
+            periodType="month",
+            period=str(period_months),
+            frequencyType="daily",
+            frequency=1,
+        )
+        resp.raise_for_status()
+        return resp.json().get("candles", [])
+
     @staticmethod
     def build_option_buy_order(
         option_symbol: str,
@@ -180,6 +220,28 @@ class SchwabService:
             "duration": "DAY",
             "orderStrategyType": "SINGLE",
             "price": f"{limit_price:.2f}",
+            "orderLegCollection": [
+                {
+                    "instruction": "BUY_TO_OPEN",
+                    "quantity": quantity,
+                    "instrument": {
+                        "symbol": option_symbol,
+                        "assetType": "OPTION",
+                    },
+                }
+            ],
+        }
+
+    @staticmethod
+    def build_option_buy_market_order(
+        option_symbol: str,
+        quantity: int,
+    ) -> dict:
+        return {
+            "orderType": "MARKET",
+            "session": "NORMAL",
+            "duration": "DAY",
+            "orderStrategyType": "SINGLE",
             "orderLegCollection": [
                 {
                     "instruction": "BUY_TO_OPEN",

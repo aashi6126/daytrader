@@ -1,4 +1,6 @@
-from datetime import date
+import math
+import random
+from datetime import date, timedelta
 
 
 class MockResponse:
@@ -44,8 +46,12 @@ class MockSchwabClient:
                                 "bid": 1.50,
                                 "ask": 1.60,
                                 "delta": 0.45,
+                                "gamma": 0.04,
+                                "theta": -0.15,
+                                "volatility": 18.0,
                                 "openInterest": 5000,
                                 "totalVolume": 10000,
+                                "daysToExpiration": 0,
                             }
                         ],
                         "602.0": [
@@ -54,8 +60,12 @@ class MockSchwabClient:
                                 "bid": 1.20,
                                 "ask": 1.35,
                                 "delta": 0.25,
+                                "gamma": 0.03,
+                                "theta": -0.10,
+                                "volatility": 20.0,
                                 "openInterest": 3000,
                                 "totalVolume": 8000,
+                                "daysToExpiration": 0,
                             }
                         ],
                     }
@@ -68,14 +78,48 @@ class MockSchwabClient:
                                 "bid": 1.45,
                                 "ask": 1.55,
                                 "delta": -0.45,
+                                "gamma": 0.04,
+                                "theta": -0.14,
+                                "volatility": 18.0,
                                 "openInterest": 4000,
                                 "totalVolume": 9000,
+                                "daysToExpiration": 0,
                             }
                         ],
                     }
                 },
             }
         )
+
+    def price_history(self, symbol, **kwargs):
+        """Generate synthetic daily candles for IV rank testing."""
+        period_months = int(kwargs.get("period", 12))
+        freq_type = kwargs.get("frequencyType", "daily")
+        if freq_type == "minute":
+            # Intraday bars — return 30 five-minute candles
+            candles = []
+            base = 600.0
+            for i in range(30):
+                o = base + random.uniform(-0.5, 0.5)
+                h = o + random.uniform(0, 1.0)
+                l = o - random.uniform(0, 1.0)
+                c = (h + l) / 2
+                candles.append({"open": o, "high": h, "low": l, "close": c, "volume": 1000000})
+                base = c
+            return MockResponse({"candles": candles})
+        # Daily bars — ~252 trading days per year
+        num_days = int(period_months * 21)  # ~21 trading days per month
+        candles = []
+        base = 550.0
+        random.seed(42)  # deterministic for tests
+        for i in range(num_days):
+            daily_return = random.gauss(0.0003, 0.012)  # ~19% annualized vol
+            c = base * math.exp(daily_return)
+            h = max(base, c) * (1 + random.uniform(0, 0.005))
+            l = min(base, c) * (1 - random.uniform(0, 0.005))
+            candles.append({"open": base, "high": h, "low": l, "close": c, "volume": 50000000})
+            base = c
+        return MockResponse({"candles": candles})
 
     def place_order(self, account_hash, order):
         self._order_counter += 1

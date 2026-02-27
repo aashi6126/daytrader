@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react'
 import { useWebSocket } from '../hooks/useWebSocket'
 import { fetchTrades } from '../api/trades'
 import { sendTestAlert, testCloseTrade } from '../api/testing'
-import { formatCurrency, statusColor } from '../utils/format'
+import { formatCurrency, isMarketOpen, statusColor } from '../utils/format'
 import type { Trade } from '../types'
 
 export default function Testing() {
@@ -44,6 +44,7 @@ export default function Testing() {
 
   useEffect(() => {
     loadOpenTrades()
+    if (!isMarketOpen()) return
     const interval = setInterval(loadOpenTrades, 15000)
     return () => clearInterval(interval)
   }, [])

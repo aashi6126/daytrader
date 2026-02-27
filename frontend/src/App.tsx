@@ -2,6 +2,8 @@ import { useEffect, useState } from 'react'
 import { BrowserRouter, Routes, Route, NavLink } from 'react-router-dom'
 import api from './api/client'
 import { fetchNgrokStatus, fetchTokenStatus, type NgrokStatus, type TokenStatus } from './api/dashboard'
+import { isMarketOpen } from './utils/format'
+import { ChatDrawer } from './components/ChatDrawer'
 import { useTheme } from './hooks/useTheme'
 import AlertsHistory from './pages/AlertsHistory'
 import Dashboard from './pages/Dashboard'
@@ -13,12 +15,14 @@ function App() {
   const [toggling, setToggling] = useState(false)
   const [ngrok, setNgrok] = useState<NgrokStatus | null>(null)
   const [token, setToken] = useState<TokenStatus | null>(null)
+  const [chatOpen, setChatOpen] = useState(false)
   const { theme, toggleTheme } = useTheme()
 
   useEffect(() => {
     api.get('/dashboard/mode').then(({ data }) => setPaperTrade(data.paper_trade))
     fetchNgrokStatus().then(setNgrok).catch(() => setNgrok({ online: false, url: null, error: 'fetch failed' }))
     fetchTokenStatus().then(setToken).catch(() => null)
+    if (!isMarketOpen()) return
     const interval = setInterval(() => {
       fetchNgrokStatus().then(setNgrok).catch(() => setNgrok({ online: false, url: null, error: 'fetch failed' }))
       fetchTokenStatus().then(setToken).catch(() => null)
@@ -66,7 +70,7 @@ function App() {
               `text-sm ${isActive ? 'text-heading font-medium' : 'text-secondary hover:text-primary'}`
             }
           >
-            Alerts
+            Signals
           </NavLink>
           <NavLink
             to="/backtest"
@@ -151,9 +155,22 @@ function App() {
         <Route path="/" element={<Dashboard />} />
         <Route path="/history" element={<TradeHistory />} />
         <Route path="/alerts" element={<AlertsHistory />} />
-
         <Route path="/backtest" element={<Backtest />} />
       </Routes>
+
+      {/* Chat FAB */}
+      {!chatOpen && (
+        <button
+          onClick={() => setChatOpen(true)}
+          className="fixed bottom-6 right-6 w-12 h-12 rounded-full bg-blue-600 hover:bg-blue-700 text-white shadow-lg flex items-center justify-center z-40"
+          title="Trading Assistant"
+        >
+          <svg className="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+            <path strokeLinecap="round" strokeLinejoin="round" d="M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-5 5v-5z" />
+          </svg>
+        </button>
+      )}
+      <ChatDrawer open={chatOpen} onClose={() => setChatOpen(false)} />
     </BrowserRouter>
   )
 }

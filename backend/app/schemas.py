@@ -93,6 +93,10 @@ class TradeResponse(BaseModel):
     best_entry_price: Optional[float] = None
     best_entry_minutes: Optional[float] = None
     ticker: Optional[str] = None
+    entry_regime: Optional[str] = None
+    entry_regime_confidence: Optional[float] = None
+    entry_vix: Optional[float] = None
+    adapter_applied: Optional[bool] = None
 
     model_config = {"from_attributes": True}
 
@@ -193,6 +197,34 @@ class PnLSummaryResponse(BaseModel):
     winning_trades: int
     losing_trades: int
     win_rate: float
+
+
+# --- Strategy ---
+
+
+class EnableStrategyRequest(BaseModel):
+    ticker: str
+    timeframe: str
+    signal_type: str
+    params: dict
+
+
+class DisableStrategyRequest(BaseModel):
+    ticker: str
+    timeframe: str
+    signal_type: str
+
+
+class EnabledStrategyEntry(BaseModel):
+    ticker: str
+    timeframe: str
+    signal_type: str
+    params: Optional[dict] = None
+    enabled_at: Optional[str] = None
+
+
+class EnabledStrategiesResponse(BaseModel):
+    strategies: List[EnabledStrategyEntry] = []
 
 
 # --- WebSocket ---

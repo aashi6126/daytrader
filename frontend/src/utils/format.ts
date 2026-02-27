@@ -36,3 +36,12 @@ export function pnlColor(value: number | null): string {
   if (value === null) return 'text-gray-400'
   return value >= 0 ? 'text-green-400' : 'text-red-400'
 }
+
+/** Returns true if US stock market is currently open (Mon-Fri 9:30-16:00 ET). */
+export function isMarketOpen(): boolean {
+  const et = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }))
+  const day = et.getDay()
+  if (day === 0 || day === 6) return false
+  const mins = et.getHours() * 60 + et.getMinutes()
+  return mins >= 9 * 60 + 30 && mins < 16 * 60
+}

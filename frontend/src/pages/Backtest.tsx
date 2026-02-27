@@ -1,4 +1,5 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, useCallback } from 'react'
+import { useLocation } from 'react-router-dom'
 import {
   BarChart, Bar, Cell, XAxis, YAxis, CartesianGrid,
   Tooltip, ResponsiveContainer, ReferenceLine,
@@ -7,24 +8,26 @@ import {
   runBacktest, runOptimization,
   type BacktestParams, type BacktestResponse, type BacktestTrade,
   type OptimizeParams, type OptimizeResponse, type OptimizeResultEntry,
-  type SignalType,
+  type SignalType, ALL_SIGNAL_TYPES,
 } from '../api/backtest'
 import {
   getAvailableTickers, runStockOptimization, runStockBacktest,
-  type TickerInfo, type StockBacktestParams,
+  searchSymbols, downloadSymbolData, saveFavorite,
+  type TickerInfo, type StockBacktestParams, type SearchResult,
 } from '../api/stockBacktest'
 import { formatCurrency } from '../utils/format'
 import { useChartColors } from '../hooks/useChartColors'
 import TopSetups from './TopSetups'
+import Favorites from './Favorites'
 
 function defaultParams(): BacktestParams {
   const end = new Date()
   const start = new Date()
-  start.setDate(end.getDate() - 30)
+  start.setDate(end.getDate() - 180)
   return {
     start_date: start.toISOString().slice(0, 10),
     end_date: end.toISOString().slice(0, 10),
-    signal_type: 'ema_cross',
+    signal_type: 'all',
     ema_fast: 8,
     ema_slow: 21,
     bar_interval: '5m',
@@ -37,7 +40,7 @@ function defaultParams(): BacktestParams {
     afternoon_enabled: true,
     entry_limit_below_percent: 5.0,
     quantity: 2,
-    delta_target: 0.4,
+    delta_target: 0.35,
     stop_loss_percent: 16.0,
     profit_target_percent: 40.0,
     trailing_stop_percent: 20.0,
@@ -48,8 +51,9 @@ function defaultParams(): BacktestParams {
     min_confluence: 5,
     vol_threshold: 1.5,
     max_daily_trades: 10,
-    max_daily_loss: 500,
+    max_daily_loss: 2000,
     max_consecutive_losses: 3,
+    entry_confirm_minutes: 0,
   }
 }
 
@@ -72,78 +76,183 @@ const REASON_COLORS: Record<string, string> = {
 }
 
 const METRIC_OPTIONS = [
+  { value: 'pro', label: 'Pro (PF + Exit Quality + Recovery)' },
   { value: 'composite', label: 'Composite (PF x \u221Atrades)' },
   { value: 'total_pnl', label: 'Total P&L' },
   { value: 'profit_factor', label: 'Profit Factor' },
   { value: 'win_rate', label: 'Win Rate' },
   { value: 'risk_adjusted', label: 'Risk Adjusted (PnL / DD)' },
+  { value: 'sharpe', label: 'Sharpe (Risk Adj x \u221Atrades)' },
 ] as const
 
+function mergeBacktestResults(results: BacktestResponse[]): BacktestResponse {
+  const allTrades = results.flatMap((r) => r.trades)
+  const dayMap = new Map<string, { pnl: number; total: number; wins: number; losses: number }>()
+  for (const r of results) {
+    for (const d of r.days) {
+      const existing = dayMap.get(d.trade_date)
+      if (existing) {
+        existing.pnl += d.pnl
+        existing.total += d.total_trades
+        existing.wins += d.winning_trades
+        existing.losses += d.losing_trades
+      } else {
+        dayMap.set(d.trade_date, { pnl: d.pnl, total: d.total_trades, wins: d.winning_trades, losses: d.losing_trades })
+      }
+    }
+  }
+  const days = [...dayMap.entries()]
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([trade_date, d]) => ({ trade_date, pnl: d.pnl, total_trades: d.total, winning_trades: d.wins, losing_trades: d.losses }))
+
+  const wins = allTrades.filter((t) => (t.pnl_dollars ?? 0) > 0)
+  const losses = allTrades.filter((t) => (t.pnl_dollars ?? 0) <= 0)
+  const totalPnl = allTrades.reduce((s, t) => s + (t.pnl_dollars ?? 0), 0)
+  const totalWins = wins.reduce((s, t) => s + (t.pnl_dollars ?? 0), 0)
+  const totalLosses = Math.abs(losses.reduce((s, t) => s + (t.pnl_dollars ?? 0), 0))
+  const exitReasons: Record<string, number> = {}
+  for (const t of allTrades) if (t.exit_reason) exitReasons[t.exit_reason] = (exitReasons[t.exit_reason] || 0) + 1
+
+  // Max drawdown from cumulative equity curve
+  let peak = 0, maxDd = 0, cum = 0
+  for (const d of days) {
+    cum += d.pnl
+    if (cum > peak) peak = cum
+    const dd = peak - cum
+    if (dd > maxDd) maxDd = dd
+  }
+
+  return {
+    summary: {
+      total_pnl: totalPnl,
+      total_trades: allTrades.length,
+      winning_trades: wins.length,
+      losing_trades: losses.length,
+      win_rate: allTrades.length > 0 ? Math.round(wins.length / allTrades.length * 1000) / 10 : 0,
+      avg_win: wins.length > 0 ? totalWins / wins.length : 0,
+      avg_loss: losses.length > 0 ? totalLosses / losses.length : 0,
+      largest_win: wins.length > 0 ? Math.max(...wins.map((t) => t.pnl_dollars ?? 0)) : 0,
+      largest_loss: losses.length > 0 ? Math.min(...losses.map((t) => t.pnl_dollars ?? 0)) : 0,
+      max_drawdown: maxDd,
+      profit_factor: totalLosses > 0 ? totalWins / totalLosses : totalWins > 0 ? 999 : 0,
+      avg_hold_minutes: allTrades.length > 0 ? allTrades.reduce((s, t) => s + (t.hold_minutes ?? 0), 0) / allTrades.length : 0,
+      exit_reasons: exitReasons,
+    },
+    days,
+    trades: allTrades.sort((a, b) => a.entry_time.localeCompare(b.entry_time)),
+  }
+}
+
 export default function Backtest() {
-  const [activeTab, setActiveTab] = useState<'setups' | 'backtest' | 'optimize'>('setups')
+  const [activeTab, setActiveTab] = useState<'setups' | 'backtest' | 'optimize' | 'favorites'>('setups')
   const [params, setParams] = useState<BacktestParams>(defaultParams)
 
   // Backtest state
   const [backtestTicker, setBacktestTicker] = useState('SPY')
   const [result, setResult] = useState<BacktestResponse | null>(null)
+  const [signalBreakdown, setSignalBreakdown] = useState<Record<string, BacktestResponse>>({})
+  const [selectedSignal, setSelectedSignal] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
+
+  // Save favorite modal
+  const [showSaveModal, setShowSaveModal] = useState(false)
+  const [saveName, setSaveName] = useState('')
+  const [saveNotes, setSaveNotes] = useState('')
+  const [saving, setSaving] = useState(false)
 
   // Optimizer state
   const [optimizeResult, setOptimizeResult] = useState<OptimizeResponse | null>(null)
   const [optimizing, setOptimizing] = useState(false)
   const [optimizeError, setOptimizeError] = useState<string | null>(null)
   const [numIterations, setNumIterations] = useState(200)
-  const [targetMetric, setTargetMetric] = useState<OptimizeParams['target_metric']>('composite')
+  const [targetMetric, setTargetMetric] = useState<OptimizeParams['target_metric']>('pro')
   const [optimizeTicker, setOptimizeTicker] = useState('SPY')
   const [optimizeInterval, setOptimizeInterval] = useState('5m')
   const [availableTickers, setAvailableTickers] = useState<TickerInfo[]>([])
 
-  useEffect(() => {
+  const refreshTickers = useCallback(() => {
     getAvailableTickers().then(setAvailableTickers).catch(() => {})
   }, [])
+
+  useEffect(() => { refreshTickers() }, [refreshTickers])
+
+  // Receive params from TopSetups "Edit & Test" navigation
+  const location = useLocation()
+  useEffect(() => {
+    const setup = (location.state as { fromSetup?: { ticker: string; timeframe: string; params: Record<string, number | string | boolean> } })?.fromSetup
+    if (!setup) return
+    const p = setup.params
+    setBacktestTicker(setup.ticker)
+    setParams((prev) => ({
+      ...prev,
+      signal_type: (p.signal_type as BacktestParams['signal_type']) || prev.signal_type,
+      ema_fast: (p.ema_fast as number) || prev.ema_fast,
+      ema_slow: (p.ema_slow as number) || prev.ema_slow,
+      bar_interval: setup.timeframe || prev.bar_interval,
+      stop_loss_percent: (p.stop_loss_percent as number) || prev.stop_loss_percent,
+      profit_target_percent: (p.profit_target_percent as number) || prev.profit_target_percent,
+      trailing_stop_percent: (p.trailing_stop_percent as number) || prev.trailing_stop_percent,
+      trailing_stop_after_scale_out_percent: (p.trailing_stop_after_scale_out_percent as number) || prev.trailing_stop_after_scale_out_percent,
+      delta_target: (p.delta_target as number) || prev.delta_target,
+      max_hold_minutes: (p.max_hold_minutes as number) || prev.max_hold_minutes,
+      rsi_period: (p.rsi_period as number) ?? prev.rsi_period,
+      atr_period: (p.atr_period as number) ?? prev.atr_period,
+      atr_stop_mult: (p.atr_stop_mult as number) || prev.atr_stop_mult,
+      orb_minutes: (p.orb_minutes as number) || prev.orb_minutes,
+      min_confluence: (p.min_confluence as number) || prev.min_confluence,
+      vol_threshold: (p.vol_threshold as number) || prev.vol_threshold,
+      max_daily_trades: (p.max_daily_trades as number) || prev.max_daily_trades,
+      max_daily_loss: (p.max_daily_loss as number) || prev.max_daily_loss,
+      max_consecutive_losses: (p.max_consecutive_losses as number) || prev.max_consecutive_losses,
+      entry_confirm_minutes: (p.entry_confirm_minutes as number) ?? prev.entry_confirm_minutes,
+    }))
+    setActiveTab('backtest')
+    setResult(null)
+    // Clear navigation state so refresh doesn't re-apply
+    window.history.replaceState({}, '')
+  }, [location.state])
 
   const set = <K extends keyof BacktestParams>(k: K, v: BacktestParams[K]) =>
     setParams((p) => ({ ...p, [k]: v }))
 
   const isSpy = backtestTicker === 'SPY'
 
-  const run = () => {
-    setLoading(true)
-    setError(null)
-
-    const promise: Promise<BacktestResponse> = isSpy
-      ? runBacktest(params)
+  const runSingle = (signalType: SignalType): Promise<BacktestResponse> => {
+    const p = { ...params, signal_type: signalType as BacktestParams['signal_type'] }
+    return isSpy
+      ? runBacktest(p)
       : runStockBacktest({
           ticker: backtestTicker,
-          start_date: params.start_date,
-          end_date: params.end_date,
-          signal_type: params.signal_type,
-          ema_fast: params.ema_fast,
-          ema_slow: params.ema_slow,
-          bar_interval: params.bar_interval,
-          rsi_period: params.rsi_period,
-          rsi_ob: params.rsi_ob,
-          rsi_os: params.rsi_os,
-          orb_minutes: params.orb_minutes,
-          atr_period: params.atr_period,
-          atr_stop_mult: params.atr_stop_mult,
-          afternoon_enabled: params.afternoon_enabled,
-          quantity: params.quantity,
-          stop_loss_percent: params.stop_loss_percent,
-          profit_target_percent: params.profit_target_percent,
-          trailing_stop_percent: params.trailing_stop_percent,
-          max_hold_minutes: params.max_hold_minutes,
-          min_confluence: params.min_confluence,
-          vol_threshold: params.vol_threshold,
-          orb_body_min_pct: 0,
-          orb_vwap_filter: false,
-          orb_gap_fade_filter: false,
+          start_date: p.start_date,
+          end_date: p.end_date,
+          signal_type: signalType,
+          ema_fast: p.ema_fast,
+          ema_slow: p.ema_slow,
+          bar_interval: p.bar_interval,
+          rsi_period: p.rsi_period,
+          rsi_ob: p.rsi_ob,
+          rsi_os: p.rsi_os,
+          orb_minutes: p.orb_minutes,
+          atr_period: p.atr_period,
+          atr_stop_mult: p.atr_stop_mult,
+          afternoon_enabled: p.afternoon_enabled,
+          quantity: p.quantity,
+          stop_loss_percent: p.stop_loss_percent,
+          profit_target_percent: p.profit_target_percent,
+          trailing_stop_percent: p.trailing_stop_percent,
+          max_hold_minutes: p.max_hold_minutes,
+          min_confluence: p.min_confluence,
+          vol_threshold: p.vol_threshold,
+          orb_body_min_pct: 0.4,
+          orb_vwap_filter: true,
+          orb_gap_fade_filter: true,
           orb_stop_mult: 1.0,
           orb_target_mult: 1.5,
-          max_daily_trades: params.max_daily_trades,
-          max_daily_loss: params.max_daily_loss,
-          max_consecutive_losses: params.max_consecutive_losses,
+          max_daily_trades: p.max_daily_trades,
+          max_daily_loss: p.max_daily_loss,
+          max_consecutive_losses: p.max_consecutive_losses,
+          entry_confirm_minutes: p.entry_confirm_minutes,
         }).then((stockResult): BacktestResponse => ({
           summary: stockResult.summary,
           days: stockResult.days,
@@ -153,11 +262,34 @@ export default function Backtest() {
             scaled_out_price: null,
           })),
         }))
+  }
 
-    promise
-      .then(setResult)
-      .catch((err) => setError(err.response?.data?.detail || 'Backtest failed'))
-      .finally(() => setLoading(false))
+  const run = () => {
+    setLoading(true)
+    setError(null)
+    setSignalBreakdown({})
+    setSelectedSignal(null)
+
+    if (params.signal_type === 'all') {
+      Promise.all(ALL_SIGNAL_TYPES.map((st) => runSingle(st).then((r) => [st, r] as const)))
+        .then((pairs) => {
+          const breakdown: Record<string, BacktestResponse> = {}
+          const results: BacktestResponse[] = []
+          for (const [st, r] of pairs) {
+            breakdown[st] = r
+            results.push(r)
+          }
+          setSignalBreakdown(breakdown)
+          setResult(mergeBacktestResults(results))
+        })
+        .catch((err) => setError(err.response?.data?.detail || 'Backtest failed'))
+        .finally(() => setLoading(false))
+    } else {
+      runSingle(params.signal_type as SignalType)
+        .then(setResult)
+        .catch((err) => setError(err.response?.data?.detail || 'Backtest failed'))
+        .finally(() => setLoading(false))
+    }
   }
 
   const optimize = () => {
@@ -187,6 +319,10 @@ export default function Backtest() {
           total_combinations_tested: stockResult.total_combinations_tested,
           elapsed_seconds: stockResult.elapsed_seconds,
           target_metric: stockResult.target_metric,
+          train_start: null,
+          train_end: null,
+          test_start: null,
+          test_end: null,
           results: stockResult.results.map((r) => ({
             rank: r.rank,
             params: r.params,
@@ -198,6 +334,11 @@ export default function Backtest() {
             avg_hold_minutes: r.avg_hold_minutes,
             score: r.score,
             exit_reasons: r.exit_reasons,
+            oos_total_pnl: null,
+            oos_total_trades: null,
+            oos_win_rate: null,
+            oos_profit_factor: null,
+            oos_score: null,
           })),
         }))
 
@@ -253,6 +394,60 @@ export default function Backtest() {
     setActiveTab('backtest')
   }
 
+  const handleSaveFavorite = async () => {
+    if (!saveName.trim() || !result) return
+    setSaving(true)
+    try {
+      await saveFavorite({
+        ticker: backtestTicker,
+        strategy_name: saveName.trim(),
+        params: {
+          ...params,
+          bar_interval: params.bar_interval,
+        },
+        summary: {
+          total_pnl: result.summary.total_pnl,
+          total_trades: result.summary.total_trades,
+          win_rate: result.summary.win_rate,
+          profit_factor: result.summary.profit_factor,
+          max_drawdown: result.summary.max_drawdown,
+          avg_hold_minutes: result.summary.avg_hold_minutes,
+        },
+        notes: saveNotes.trim() || undefined,
+      })
+      setShowSaveModal(false)
+      setSaveName('')
+      setSaveNotes('')
+    } catch (err) {
+      console.error('Failed to save favorite:', err)
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const handleLoadFavorite = (ticker: string, btParams: StockBacktestParams) => {
+    setBacktestTicker(ticker)
+    setParams((prev) => ({
+      ...prev,
+      start_date: btParams.start_date,
+      end_date: btParams.end_date,
+      signal_type: btParams.signal_type as BacktestParams['signal_type'],
+      ema_fast: btParams.ema_fast,
+      ema_slow: btParams.ema_slow,
+      bar_interval: btParams.bar_interval as '5m' | '1m',
+      rsi_period: btParams.rsi_period,
+      stop_loss_percent: btParams.stop_loss_percent,
+      profit_target_percent: btParams.profit_target_percent,
+      trailing_stop_percent: btParams.trailing_stop_percent,
+      max_hold_minutes: btParams.max_hold_minutes,
+      min_confluence: btParams.min_confluence,
+      vol_threshold: btParams.vol_threshold,
+      quantity: btParams.quantity,
+    }))
+    setResult(null)
+    setActiveTab('backtest')
+  }
+
   return (
     <div className="max-w-7xl mx-auto px-4 py-6 space-y-6">
       <div className="flex items-center gap-4">
@@ -282,6 +477,14 @@ export default function Backtest() {
           >
             Optimize
           </button>
+          <button
+            onClick={() => setActiveTab('favorites')}
+            className={`px-4 py-1.5 rounded-md text-sm font-medium transition-colors ${
+              activeTab === 'favorites' ? 'bg-yellow-600 text-white' : 'text-secondary hover:text-primary'
+            }`}
+          >
+            Favorites
+          </button>
         </div>
       </div>
 
@@ -296,9 +499,9 @@ export default function Backtest() {
             <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-7 gap-4 text-sm">
               <label className="space-y-1">
                 <span className="text-secondary">Ticker</span>
-                <select value={backtestTicker}
-                  onChange={(e) => {
-                    const t = e.target.value
+                <TickerSearch
+                  value={backtestTicker}
+                  onChange={(t) => {
                     setBacktestTicker(t)
                     setResult(null)
                     if (t !== 'SPY') {
@@ -310,12 +513,9 @@ export default function Backtest() {
                       set('bar_interval', '5m')
                     }
                   }}
-                  className="w-full bg-elevated rounded px-2 py-1.5 text-heading">
-                  <option value="SPY">SPY</option>
-                  {availableTickers.map((t) => (
-                    <option key={t.ticker} value={t.ticker}>{t.ticker}</option>
-                  ))}
-                </select>
+                  availableTickers={availableTickers}
+                  onTickerDownloaded={refreshTickers}
+                />
               </label>
               <label className="space-y-1">
                 <span className="text-secondary">Start Date</span>
@@ -332,8 +532,9 @@ export default function Backtest() {
               <label className="space-y-1">
                 <span className="text-secondary">Signal</span>
                 <select value={params.signal_type}
-                  onChange={(e) => set('signal_type', e.target.value as SignalType)}
+                  onChange={(e) => set('signal_type', e.target.value as SignalType | 'all')}
                   className="w-full bg-elevated rounded px-2 py-1.5 text-heading">
+                  <option value="all">All Signals</option>
                   <option value="ema_cross">EMA Cross</option>
                   <option value="vwap_cross">VWAP Cross</option>
                   <option value="ema_vwap">EMA + VWAP</option>
@@ -397,6 +598,19 @@ export default function Backtest() {
                 <input type="number" step="0.5" value={params.vol_threshold} min={1.0} max={3.0}
                   onChange={(e) => set('vol_threshold', +e.target.value)}
                   className="w-full bg-elevated rounded px-2 py-1.5 text-heading" />
+              </label>
+              <label className="space-y-1">
+                <span className="text-secondary">Confirm Min</span>
+                <select value={params.entry_confirm_minutes}
+                  onChange={(e) => set('entry_confirm_minutes', +e.target.value)}
+                  className="w-full bg-elevated rounded px-2 py-1.5 text-heading">
+                  <option value={0}>0 (Immediate)</option>
+                  <option value={1}>1 min</option>
+                  <option value={2}>2 min</option>
+                  <option value={3}>3 min</option>
+                  <option value={5}>5 min</option>
+                  <option value={15}>15 min</option>
+                </select>
               </label>
 
               <label className="space-y-1">
@@ -471,13 +685,23 @@ export default function Backtest() {
                 </label>
               )}
 
-              <button
-                onClick={run}
-                disabled={loading}
-                className="ml-auto px-6 py-2 rounded bg-blue-600 hover:bg-blue-500 text-white font-medium text-sm disabled:opacity-50 disabled:cursor-not-allowed"
-              >
-                {loading ? 'Running...' : `Run ${backtestTicker} Backtest`}
-              </button>
+              <div className="ml-auto flex gap-2">
+                {result && !loading && (
+                  <button
+                    onClick={() => { setSaveName(`${backtestTicker} ${params.signal_type}`); setShowSaveModal(true) }}
+                    className="px-4 py-2 rounded bg-yellow-600/30 hover:bg-yellow-600 text-yellow-400 hover:text-white font-medium text-sm transition-colors"
+                  >
+                    Save as Favorite
+                  </button>
+                )}
+                <button
+                  onClick={run}
+                  disabled={loading}
+                  className="px-6 py-2 rounded bg-blue-600 hover:bg-blue-500 text-white font-medium text-sm disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  {loading ? 'Running...' : `Run ${backtestTicker} Backtest`}
+                </button>
+              </div>
             </div>
 
             {error && (
@@ -495,14 +719,39 @@ export default function Backtest() {
             </div>
           )}
 
-          {result && !loading && (
-            <>
-              <SummaryCards summary={result.summary} />
-              <DailyPnLChart days={result.days} totalPnl={result.summary.total_pnl} />
-              <ExitReasons reasons={result.summary.exit_reasons} />
-              <TradeList trades={result.trades} />
-            </>
-          )}
+          {result && !loading && (() => {
+            const drillResult = selectedSignal && signalBreakdown[selectedSignal] ? signalBreakdown[selectedSignal] : null
+            const displayResult = drillResult || result
+            return (
+              <>
+                {!drillResult && <SummaryCards summary={result.summary} />}
+                {Object.keys(signalBreakdown).length > 0 && !drillResult && (
+                  <SignalBreakdownTable breakdown={signalBreakdown} onSelect={setSelectedSignal} />
+                )}
+                {drillResult && (
+                  <div className="flex items-center gap-3 mb-2">
+                    <button
+                      onClick={() => setSelectedSignal(null)}
+                      className="px-3 py-1.5 rounded text-sm font-medium bg-elevated hover:bg-hover text-secondary hover:text-primary"
+                    >
+                      &larr; All Signals
+                    </button>
+                    <span className="text-heading font-medium">
+                      {SIGNAL_LABELS[selectedSignal!] || selectedSignal}
+                    </span>
+                    <span className={`text-sm ${drillResult.summary.total_pnl >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                      {formatCurrency(drillResult.summary.total_pnl)}
+                    </span>
+                    <span className="text-sm text-secondary">{drillResult.summary.total_trades} trades</span>
+                  </div>
+                )}
+                {drillResult && <SummaryCards summary={drillResult.summary} />}
+                <DailyPnLChart days={displayResult.days} totalPnl={displayResult.summary.total_pnl} />
+                <ExitReasons reasons={displayResult.summary.exit_reasons} />
+                <TradeList trades={displayResult.trades} />
+              </>
+            )
+          })()}
         </>
       )}
 
@@ -516,9 +765,9 @@ export default function Backtest() {
             <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-7 gap-4 text-sm">
               <label className="space-y-1">
                 <span className="text-secondary">Ticker</span>
-                <select value={optimizeTicker}
-                  onChange={(e) => {
-                    const t = e.target.value
+                <TickerSearch
+                  value={optimizeTicker}
+                  onChange={(t) => {
                     setOptimizeTicker(t)
                     setOptimizeResult(null)
                     if (t !== 'SPY') {
@@ -530,12 +779,9 @@ export default function Backtest() {
                       setOptimizeInterval('5m')
                     }
                   }}
-                  className="w-full bg-elevated rounded px-2 py-1.5 text-heading">
-                  <option value="SPY">SPY</option>
-                  {availableTickers.map((t) => (
-                    <option key={t.ticker} value={t.ticker}>{t.ticker}</option>
-                  ))}
-                </select>
+                  availableTickers={availableTickers}
+                  onTickerDownloaded={refreshTickers}
+                />
               </label>
 
               {optimizeTicker === 'SPY' && (
@@ -648,6 +894,183 @@ export default function Backtest() {
           )}
         </>
       )}
+
+      {activeTab === 'favorites' && (
+        <Favorites onLoadBacktest={handleLoadFavorite} />
+      )}
+
+      {/* Save as Favorite modal */}
+      {showSaveModal && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50" onClick={() => setShowSaveModal(false)}>
+          <div className="bg-surface rounded-lg p-6 w-full max-w-md space-y-4" onClick={(e) => e.stopPropagation()}>
+            <h3 className="text-lg font-semibold">Save as Favorite</h3>
+            <label className="block space-y-1">
+              <span className="text-sm text-secondary">Strategy Name</span>
+              <input
+                type="text"
+                value={saveName}
+                onChange={(e) => setSaveName(e.target.value)}
+                placeholder={`${backtestTicker} ${params.signal_type}`}
+                className="w-full bg-elevated rounded px-3 py-2 text-heading"
+                autoFocus
+              />
+            </label>
+            <label className="block space-y-1">
+              <span className="text-sm text-secondary">Notes (optional)</span>
+              <textarea
+                value={saveNotes}
+                onChange={(e) => setSaveNotes(e.target.value)}
+                rows={2}
+                className="w-full bg-elevated rounded px-3 py-2 text-heading resize-none"
+              />
+            </label>
+            <div className="flex gap-3 justify-end">
+              <button
+                onClick={() => setShowSaveModal(false)}
+                className="px-4 py-2 text-sm text-secondary hover:text-heading"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleSaveFavorite}
+                disabled={saving || !saveName.trim()}
+                className="px-4 py-2 rounded bg-yellow-600 hover:bg-yellow-500 text-white text-sm font-medium disabled:opacity-50"
+              >
+                {saving ? 'Saving...' : 'Save'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+
+// ── Searchable Ticker Input ─────────────────────────────────────
+
+function TickerSearch({ value, onChange, availableTickers, onTickerDownloaded }: {
+  value: string
+  onChange: (ticker: string) => void
+  availableTickers: TickerInfo[]
+  onTickerDownloaded: () => void
+}) {
+  const [query, setQuery] = useState(value)
+  const [results, setResults] = useState<SearchResult[]>([])
+  const [showDropdown, setShowDropdown] = useState(false)
+  const [downloading, setDownloading] = useState<string | null>(null)
+  const timerRef = useRef<ReturnType<typeof setTimeout>>()
+  const containerRef = useRef<HTMLDivElement>(null)
+
+  // Quick picks = downloaded tickers
+  const quickPicks = availableTickers.map((t) => t.ticker)
+
+  // Debounced search
+  useEffect(() => {
+    if (!query || query.length < 1) {
+      setResults([])
+      return
+    }
+    clearTimeout(timerRef.current)
+    timerRef.current = setTimeout(() => {
+      searchSymbols(query).then(setResults).catch(() => setResults([]))
+    }, 250)
+    return () => clearTimeout(timerRef.current)
+  }, [query])
+
+  // Close dropdown on outside click
+  useEffect(() => {
+    const handler = (e: MouseEvent) => {
+      if (containerRef.current && !containerRef.current.contains(e.target as Node)) {
+        setShowDropdown(false)
+      }
+    }
+    document.addEventListener('mousedown', handler)
+    return () => document.removeEventListener('mousedown', handler)
+  }, [])
+
+  const selectTicker = (ticker: string) => {
+    setQuery(ticker)
+    onChange(ticker)
+    setShowDropdown(false)
+  }
+
+  const handleDownload = async (symbol: string) => {
+    setDownloading(symbol)
+    try {
+      const resp = await downloadSymbolData(symbol)
+      if (resp.ok) {
+        onTickerDownloaded()
+        selectTicker(symbol)
+      }
+    } catch (err) {
+      console.error('Download failed:', err)
+    } finally {
+      setDownloading(null)
+    }
+  }
+
+  return (
+    <div ref={containerRef} className="relative">
+      <input
+        type="text"
+        value={query}
+        onChange={(e) => {
+          setQuery(e.target.value.toUpperCase())
+          setShowDropdown(true)
+        }}
+        onFocus={() => setShowDropdown(true)}
+        placeholder="Search ticker..."
+        className="w-full bg-elevated rounded px-2 py-1.5 text-heading"
+      />
+      {showDropdown && (
+        <div className="absolute z-20 top-full left-0 right-0 mt-1 bg-elevated border border-subtle rounded-lg shadow-lg max-h-64 overflow-y-auto">
+          {/* Quick picks */}
+          {!query && quickPicks.length > 0 && (
+            <div className="p-2 border-b border-subtle">
+              <p className="text-xs text-muted mb-1">Downloaded</p>
+              <div className="flex flex-wrap gap-1">
+                {['SPY', ...quickPicks].map((t) => (
+                  <button
+                    key={t}
+                    onClick={() => selectTicker(t)}
+                    className={`px-2 py-0.5 rounded text-xs font-medium transition-colors ${
+                      t === value ? 'bg-blue-600 text-white' : 'bg-surface text-secondary hover:text-heading'
+                    }`}
+                  >
+                    {t}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+          {/* Search results */}
+          {query && results.map((r) => (
+            <div
+              key={r.symbol}
+              className="flex items-center justify-between px-3 py-2 hover:bg-hover cursor-pointer"
+              onClick={() => r.has_data ? selectTicker(r.symbol) : undefined}
+            >
+              <div className="flex items-center gap-2">
+                <span className="font-medium text-sm">{r.symbol}</span>
+                {r.has_data && <span className="text-xs text-green-400">Ready</span>}
+              </div>
+              {!r.has_data && (
+                <button
+                  onClick={(e) => { e.stopPropagation(); handleDownload(r.symbol) }}
+                  disabled={downloading === r.symbol}
+                  className="px-2 py-0.5 rounded bg-blue-600/30 hover:bg-blue-600 text-blue-400 hover:text-white text-xs font-medium transition-colors disabled:opacity-50"
+                >
+                  {downloading === r.symbol ? 'Downloading...' : 'Download'}
+                </button>
+              )}
+            </div>
+          ))}
+          {query && results.length === 0 && (
+            <p className="px-3 py-2 text-xs text-muted">No matches</p>
+          )}
+        </div>
+      )}
     </div>
   )
 }
@@ -676,6 +1099,7 @@ function OptimizerResults({ result, onApply, ticker = 'SPY', interval = '5m' }: 
 }) {
   const metricLabel = METRIC_OPTIONS.find((m) => m.value === result.target_metric)?.label ?? result.target_metric
   const isSpy = ticker === 'SPY'
+  const hasOos = result.results.some((r) => r.oos_total_pnl != null)
 
   // Drill-down state
   const [btResult, setBtResult] = useState<BacktestResponse | null>(null)
@@ -691,10 +1115,13 @@ function OptimizerResults({ result, onApply, ticker = 'SPY', interval = '5m' }: 
     setBtLabel(`${ticker} @ ${interval} — ${SIGNAL_LABELS[entry.params.signal_type as string] || entry.params.signal_type}`)
 
     const p = entry.params
+    const dEnd = new Date()
+    const dStart = new Date()
+    dStart.setDate(dEnd.getDate() - 180)
     const params: StockBacktestParams = {
       ticker,
-      start_date: '2025-01-01',
-      end_date: '2026-12-31',
+      start_date: dStart.toISOString().slice(0, 10),
+      end_date: dEnd.toISOString().slice(0, 10),
       signal_type: p.signal_type as string,
       ema_fast: p.ema_fast as number,
       ema_slow: p.ema_slow as number,
@@ -719,7 +1146,7 @@ function OptimizerResults({ result, onApply, ticker = 'SPY', interval = '5m' }: 
       orb_stop_mult: (p.orb_stop_mult as number) || 1.0,
       orb_target_mult: (p.orb_target_mult as number) || 1.5,
       max_daily_trades: 10,
-      max_daily_loss: 500,
+      max_daily_loss: 2000,
       max_consecutive_losses: 3,
     }
 
@@ -745,7 +1172,7 @@ function OptimizerResults({ result, onApply, ticker = 'SPY', interval = '5m' }: 
 
   return (
     <div className="space-y-4">
-      <div className="bg-surface rounded-lg p-4 flex items-center gap-6 text-sm">
+      <div className="bg-surface rounded-lg p-4 flex items-center gap-6 text-sm flex-wrap">
         <span className="text-secondary">
           Tested <span className="text-heading font-semibold">{result.total_combinations_tested}</span> combinations
           in <span className="text-heading font-semibold">{result.elapsed_seconds.toFixed(1)}s</span>
@@ -753,6 +1180,12 @@ function OptimizerResults({ result, onApply, ticker = 'SPY', interval = '5m' }: 
         <span className="text-secondary">
           Ranked by: <span className="text-purple-400 font-medium">{metricLabel}</span>
         </span>
+        {result.train_start && result.test_start && (
+          <span className="text-secondary">
+            Walk-forward: train <span className="text-blue-400">{result.train_start}</span> to <span className="text-blue-400">{result.train_end}</span>
+            {' | '}test <span className="text-orange-400">{result.test_start}</span> to <span className="text-orange-400">{result.test_end}</span>
+          </span>
+        )}
       </div>
 
       <div className="bg-surface rounded-lg p-6 overflow-x-auto">
@@ -778,6 +1211,9 @@ function OptimizerResults({ result, onApply, ticker = 'SPY', interval = '5m' }: 
               <th className="text-right pb-3 pr-3">WR%</th>
               <th className="text-right pb-3 pr-3">PF</th>
               <th className="text-right pb-3 pr-3">MaxDD</th>
+              {hasOos && <th className="text-right pb-3 pr-3 text-orange-400/70">OOS P&L</th>}
+              {hasOos && <th className="text-right pb-3 pr-3 text-orange-400/70">OOS WR%</th>}
+              {hasOos && <th className="text-right pb-3 pr-3 text-orange-400/70">OOS PF</th>}
               <th className="text-center pb-3"></th>
             </tr>
           </thead>
@@ -811,6 +1247,21 @@ function OptimizerResults({ result, onApply, ticker = 'SPY', interval = '5m' }: 
                 <td className="py-2.5 pr-3 text-right text-red-400">
                   {formatCurrency(r.max_drawdown)}
                 </td>
+                {hasOos && (
+                  <td className={`py-2.5 pr-3 text-right font-semibold ${(r.oos_total_pnl ?? 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                    {r.oos_total_pnl != null ? formatCurrency(r.oos_total_pnl) : '-'}
+                  </td>
+                )}
+                {hasOos && (
+                  <td className={`py-2.5 pr-3 text-right ${(r.oos_win_rate ?? 0) >= 50 ? 'text-green-400' : 'text-yellow-400'}`}>
+                    {r.oos_win_rate != null ? `${r.oos_win_rate.toFixed(0)}%` : '-'}
+                  </td>
+                )}
+                {hasOos && (
+                  <td className={`py-2.5 pr-3 text-right ${(r.oos_profit_factor ?? 0) >= 1 ? 'text-green-400' : 'text-red-400'}`}>
+                    {r.oos_profit_factor != null ? r.oos_profit_factor.toFixed(2) : '-'}
+                  </td>
+                )}
                 <td className="py-2.5 text-center">
                   {onApply ? (
                     <button
@@ -870,6 +1321,51 @@ function OptimizerResults({ result, onApply, ticker = 'SPY', interval = '5m' }: 
 
 
 // ── Backtest Result Components ───────────────────────────────────
+
+function SignalBreakdownTable({ breakdown, onSelect }: { breakdown: Record<string, BacktestResponse>; onSelect: (signal: string) => void }) {
+  const rows = Object.entries(breakdown)
+    .map(([signal, r]) => ({ signal, s: r.summary }))
+    .sort((a, b) => b.s.total_pnl - a.s.total_pnl)
+
+  return (
+    <div className="bg-surface rounded-lg border border-subtle overflow-x-auto">
+      <table className="w-full text-sm">
+        <thead>
+          <tr className="border-b border-subtle text-secondary">
+            <th className="text-left px-3 py-2 font-medium">Signal</th>
+            <th className="text-right px-3 py-2 font-medium">P&L</th>
+            <th className="text-right px-3 py-2 font-medium">Trades</th>
+            <th className="text-right px-3 py-2 font-medium">Win%</th>
+            <th className="text-right px-3 py-2 font-medium">PF</th>
+            <th className="text-right px-3 py-2 font-medium">Avg Win</th>
+            <th className="text-right px-3 py-2 font-medium">Avg Loss</th>
+            <th className="text-right px-3 py-2 font-medium">Max DD</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map(({ signal, s }) => (
+            <tr key={signal} className="border-b border-subtle/50 hover:bg-hover cursor-pointer" onClick={() => onSelect(signal)}>
+              <td className="px-3 py-1.5 font-medium text-blue-400 hover:text-blue-300">{SIGNAL_LABELS[signal] || signal}</td>
+              <td className={`text-right px-3 py-1.5 ${s.total_pnl >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                {formatCurrency(s.total_pnl)}
+              </td>
+              <td className="text-right px-3 py-1.5 text-primary">{s.total_trades}</td>
+              <td className={`text-right px-3 py-1.5 ${s.win_rate >= 50 ? 'text-green-400' : 'text-yellow-400'}`}>
+                {s.win_rate.toFixed(0)}%
+              </td>
+              <td className={`text-right px-3 py-1.5 ${s.profit_factor >= 1 ? 'text-green-400' : 'text-red-400'}`}>
+                {s.profit_factor.toFixed(2)}
+              </td>
+              <td className="text-right px-3 py-1.5 text-green-400">{formatCurrency(s.avg_win)}</td>
+              <td className="text-right px-3 py-1.5 text-red-400">{formatCurrency(s.avg_loss)}</td>
+              <td className="text-right px-3 py-1.5 text-red-400">{formatCurrency(s.max_drawdown)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  )
+}
 
 function SummaryCards({ summary }: { summary: BacktestResponse['summary'] }) {
   const cards = [
@@ -964,6 +1460,7 @@ function TradeList({ trades }: { trades: BacktestTrade[] }) {
           <tr className="text-secondary border-b border-subtle">
             <th className="text-left pb-3 pr-4">Date / Time</th>
             <th className="text-left pb-3 pr-4">Dir</th>
+            <th className="text-left pb-3 pr-4">Signal</th>
             <th className="text-right pb-3 pr-4">Strike</th>
             <th className="text-right pb-3 pr-4">Underlying</th>
             <th className="text-left pb-3 pr-4">Expiry</th>
@@ -985,6 +1482,9 @@ function TradeList({ trades }: { trades: BacktestTrade[] }) {
               <td className={`py-2 pr-4 font-semibold ${t.direction === 'CALL' ? 'text-green-400' : 'text-red-400'}`}>
                 {t.direction}
               </td>
+              <td className="py-2 pr-4 text-xs text-secondary max-w-[200px] truncate" title={t.entry_reason || ''}>
+                {t.entry_reason || '-'}
+              </td>
               <td className="py-2 pr-4 text-right">${t.strike.toFixed(0)}</td>
               <td className="py-2 pr-4 text-right text-secondary">
                 {t.underlying_price != null ? `$${t.underlying_price.toFixed(2)}` : '-'}
@@ -1005,7 +1505,7 @@ function TradeList({ trades }: { trades: BacktestTrade[] }) {
               <td className={`py-2 pr-4 text-right ${(t.pnl_percent ?? 0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
                 {t.pnl_percent != null ? `${t.pnl_percent > 0 ? '+' : ''}${t.pnl_percent.toFixed(1)}%` : '-'}
               </td>
-              <td className="py-2 pr-4 text-xs">{t.exit_reason?.replace(/_/g, ' ') || '-'}</td>
+              <td className="py-2 pr-4 text-xs" title={t.exit_detail || ''}>{t.exit_reason?.replace(/_/g, ' ') || '-'}</td>
               <td className="py-2 text-right text-xs text-secondary">
                 {t.hold_minutes != null ? `${t.hold_minutes.toFixed(0)}m` : '-'}
               </td>

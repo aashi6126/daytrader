@@ -35,6 +35,7 @@ export interface StockBacktestParams {
   max_daily_trades: number
   max_daily_loss: number
   max_consecutive_losses: number
+  entry_confirm_minutes: number
 }
 
 export interface StockTrade {
@@ -56,6 +57,8 @@ export interface StockTrade {
   expiry_date: string | null
   dte: number
   delta: number | null
+  entry_reason: string | null
+  exit_detail: string | null
 }
 
 export interface StockDay {
@@ -80,6 +83,8 @@ export interface StockSummary {
   profit_factor: number
   avg_hold_minutes: number
   exit_reasons: Record<string, number>
+  avg_entry_price: number
+  max_entry_price: number
 }
 
 export interface StockBacktestResponse {
@@ -115,6 +120,22 @@ export interface StockOptimizeResultEntry {
   score: number
   exit_reasons: Record<string, number>
   days_traded: number
+  avg_entry_price: number
+  max_entry_price: number
+  // Out-of-sample (walk-forward) metrics
+  oos_total_pnl?: number | null
+  oos_total_trades?: number | null
+  oos_win_rate?: number | null
+  oos_profit_factor?: number | null
+  oos_max_drawdown?: number | null
+  oos_score?: number | null
+  // Monte Carlo bootstrap confidence
+  mc_win_pct?: number | null
+  mc_median_pnl?: number | null
+  mc_p5_pnl?: number | null
+  mc_p95_pnl?: number | null
+  // Market cap tier
+  market_cap_tier?: string | null
 }
 
 export interface StockOptimizeResponse {
@@ -139,7 +160,156 @@ export async function runStockOptimization(params: StockOptimizeParams): Promise
   return data
 }
 
-export async function getSavedResults(): Promise<StockOptimizeResultEntry[]> {
-  const { data } = await api.get('/stock-backtest/results')
+export async function clearSavedResults(): Promise<void> {
+  await api.delete('/stock-backtest/results')
+}
+
+export async function getSavedResults(minTrades: number = 0, limit: number = 0): Promise<StockOptimizeResultEntry[]> {
+  const params: Record<string, number> = {}
+  if (minTrades > 0) params.min_trades = minTrades
+  if (limit > 0) params.limit = limit
+  const { data } = await api.get('/stock-backtest/results', { params })
+  return data
+}
+
+// ── Batch Optimize ──────────────────────────────────────────────
+
+export interface BatchOptimizeRequest {
+  iterations: number
+  metric: string
+  min_trades: number
+  market_cap_tier: string
+  tickers?: string[]
+}
+
+export interface MarketCapTier {
+  value: string
+  label: string
+  count: number
+}
+
+export interface BatchOptimizeStatus {
+  status: 'idle' | 'running' | 'completed' | 'failed'
+  progress: string
+  elapsed_seconds: number
+  results_count: number
+  error: string
+}
+
+export async function getMarketCapTiers(): Promise<MarketCapTier[]> {
+  const { data } = await api.get('/stock-backtest/tiers')
+  return data
+}
+
+export async function startBatchOptimize(req: BatchOptimizeRequest): Promise<BatchOptimizeStatus> {
+  const { data } = await api.post('/stock-backtest/batch-optimize', req)
+  return data
+}
+
+export async function getBatchOptimizeStatus(): Promise<BatchOptimizeStatus> {
+  const { data } = await api.get('/stock-backtest/batch-optimize/status')
+  return data
+}
+
+// ── Search & Download ────────────────────────────────────────────
+
+export interface SearchResult {
+  symbol: string
+  has_data: boolean
+}
+
+export interface DownloadResponse {
+  ok: boolean
+  symbol: string
+  message: string
+  files: number
+  total_rows: number
+}
+
+export async function searchSymbols(query: string): Promise<SearchResult[]> {
+  const { data } = await api.post(`/stock-backtest/search?query=${encodeURIComponent(query)}`)
+  return data
+}
+
+export async function downloadSymbolData(symbol: string): Promise<DownloadResponse> {
+  const { data } = await api.post(`/stock-backtest/download/${encodeURIComponent(symbol)}`, {}, { timeout: 600000 })
+  return data
+}
+
+// ── Favorites ────────────────────────────────────────────────────
+
+export interface FavoriteStrategy {
+  id: number
+  ticker: string
+  strategy_name: string
+  direction: string | null
+  params: Record<string, number | string | boolean>
+  summary: Record<string, number> | null
+  notes: string | null
+  created_at: string
+}
+
+export interface SaveFavoriteRequest {
+  ticker: string
+  strategy_name: string
+  direction?: string
+  params: Record<string, number | string | boolean>
+  summary?: Record<string, number>
+  notes?: string
+}
+
+export async function getFavorites(): Promise<FavoriteStrategy[]> {
+  const { data } = await api.get('/stock-backtest/favorites')
+  return data
+}
+
+export async function saveFavorite(req: SaveFavoriteRequest): Promise<FavoriteStrategy> {
+  const { data } = await api.post('/stock-backtest/favorites', req)
+  return data
+}
+
+export async function deleteFavorite(id: number): Promise<void> {
+  await api.delete(`/stock-backtest/favorites/${id}`)
+}
+
+// ── Strategy enable/disable (multi-strategy) ────────────────────
+
+export interface EnableStrategyRequest {
+  ticker: string
+  timeframe: string
+  signal_type: string
+  params: Record<string, number | string | boolean>
+}
+
+export interface DisableStrategyRequest {
+  ticker: string
+  timeframe: string
+  signal_type: string
+}
+
+export interface EnabledStrategyEntry {
+  ticker: string
+  timeframe: string
+  signal_type: string
+  params?: Record<string, number | string | boolean>
+  enabled_at?: string
+}
+
+export interface EnabledStrategiesResponse {
+  strategies: EnabledStrategyEntry[]
+}
+
+export async function getStrategyStatus(): Promise<EnabledStrategiesResponse> {
+  const { data } = await api.get('/strategies/enabled')
+  return data
+}
+
+export async function enableStrategy(req: EnableStrategyRequest): Promise<EnabledStrategiesResponse> {
+  const { data } = await api.post('/strategies/enable', req)
+  return data
+}
+
+export async function disableStrategy(req: DisableStrategyRequest): Promise<EnabledStrategiesResponse> {
+  const { data } = await api.post('/strategies/disable', req)
   return data
 }

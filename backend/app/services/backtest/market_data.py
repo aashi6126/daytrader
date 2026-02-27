@@ -95,7 +95,7 @@ def load_csv_bars(
     """
     interval_map = {"1m": "1min", "5m": "5min", "10m": "10min", "15m": "15min", "30m": "30min"}
     csv_label = interval_map.get(interval, interval.replace("m", "min"))
-    csv_path = os.path.normpath(os.path.join(_DATA_DIR, f"SPY_{csv_label}_6months.csv"))
+    csv_path = os.path.normpath(os.path.join(_DATA_DIR, "SPY", f"SPY_{csv_label}_6months.csv"))
 
     if not os.path.exists(csv_path):
         logger.warning(f"CSV not found: {csv_path}, falling back to yfinance")
@@ -134,6 +134,43 @@ def load_csv_bars(
         f"({start_date} to {end_date})"
     )
     return bars_by_day
+
+
+def resample_bars(bars_by_day: dict[date, list[BarData]], target_minutes: int) -> dict[date, list[BarData]]:
+    """Resample 1-minute bars into N-minute bars (2m, 3m, etc.)."""
+    resampled: dict[date, list[BarData]] = {}
+    for day, day_bars in bars_by_day.items():
+        if not day_bars:
+            continue
+        new_bars: list[BarData] = []
+        bucket: list[BarData] = []
+        bucket_start = day_bars[0].timestamp
+        for bar in day_bars:
+            mins_since = (bar.timestamp - bucket_start).total_seconds() / 60
+            if mins_since >= target_minutes and bucket:
+                new_bars.append(BarData(
+                    timestamp=bucket[0].timestamp,
+                    open=bucket[0].open,
+                    high=max(b.high for b in bucket),
+                    low=min(b.low for b in bucket),
+                    close=bucket[-1].close,
+                    volume=sum(b.volume for b in bucket),
+                ))
+                bucket = [bar]
+                bucket_start = bar.timestamp
+            else:
+                bucket.append(bar)
+        if bucket:
+            new_bars.append(BarData(
+                timestamp=bucket[0].timestamp,
+                open=bucket[0].open,
+                high=max(b.high for b in bucket),
+                low=min(b.low for b in bucket),
+                close=bucket[-1].close,
+                volume=sum(b.volume for b in bucket),
+            ))
+        resampled[day] = new_bars
+    return resampled
 
 
 def fetch_vix_daily(start_date: date, end_date: date) -> dict[date, float]:

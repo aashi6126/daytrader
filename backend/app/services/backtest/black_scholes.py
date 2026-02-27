@@ -72,16 +72,46 @@ def select_strike_for_delta(
     option_type: Literal["CALL", "PUT"] = "CALL",
     strike_interval: float = 1.0,
 ) -> tuple[float, OptionPrice]:
-    """Find the strike closest to target delta using real strike intervals."""
+    """Find the strike closest to target delta using binary search.
+
+    Delta is monotonic in strike: for calls, |delta| decreases as strike
+    increases; for puts, |delta| increases as strike increases. This lets
+    us binary search instead of brute-forcing 41 strikes (~8 B-S calls
+    instead of 41).
+    """
     T = minutes_to_expiry / 525600.0
     sigma = vix / 100.0
     atm_strike = round(ticker_price / strike_interval) * strike_interval
 
+    # Binary search over offset range [-20, 20]
+    lo, hi = -20, 20
+    while lo < hi - 1:
+        mid_offset = (lo + hi) // 2
+        strike = atm_strike + mid_offset * strike_interval
+        if strike <= 0:
+            lo = mid_offset
+            continue
+        opt = black_scholes(ticker_price, strike, T, sigma, option_type=option_type)
+        current_delta = abs(opt.delta)
+        # For calls: |delta| decreases as strike increases (move lo up to go OTM)
+        # For puts: |delta| increases as strike increases (move hi down to go OTM)
+        if option_type == "CALL":
+            if current_delta > target_delta:
+                lo = mid_offset  # need higher strike (lower delta)
+            else:
+                hi = mid_offset  # need lower strike (higher delta)
+        else:
+            if current_delta > target_delta:
+                hi = mid_offset  # need lower strike (lower |delta|)
+            else:
+                lo = mid_offset  # need higher strike (higher |delta|)
+
+    # Check lo, hi, and immediate neighbors to find the absolute best
     best_strike = atm_strike
     best_opt = black_scholes(ticker_price, atm_strike, T, sigma, option_type=option_type)
     best_diff = abs(abs(best_opt.delta) - target_delta)
 
-    for offset in range(-20, 21):
+    for offset in (lo - 1, lo, hi, hi + 1):
         strike = atm_strike + offset * strike_interval
         if strike <= 0:
             continue
@@ -93,6 +123,19 @@ def select_strike_for_delta(
             best_opt = opt
 
     return best_strike, best_opt
+
+
+def estimate_option_price_and_delta(
+    ticker_price: float,
+    strike: float,
+    minutes_to_expiry: float,
+    vix: float,
+    option_type: Literal["CALL", "PUT"] = "CALL",
+) -> OptionPrice:
+    """Return both price and delta from a single B-S evaluation."""
+    T = minutes_to_expiry / 525600.0
+    sigma = vix / 100.0
+    return black_scholes(ticker_price, strike, T, sigma, option_type=option_type)
 
 
 def estimate_option_price_at(

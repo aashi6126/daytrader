@@ -2,10 +2,12 @@ import api from './client'
 
 export type SignalType = 'ema_cross' | 'vwap_cross' | 'ema_vwap' | 'orb' | 'vwap_rsi' | 'bb_squeeze' | 'rsi_reversal' | 'confluence'
 
+export const ALL_SIGNAL_TYPES: SignalType[] = ['ema_cross', 'vwap_cross', 'ema_vwap', 'orb', 'vwap_rsi', 'bb_squeeze', 'rsi_reversal', 'confluence']
+
 export interface BacktestParams {
   start_date: string
   end_date: string
-  signal_type: SignalType
+  signal_type: SignalType | 'all'
   ema_fast: number
   ema_slow: number
   bar_interval: '5m' | '1m'
@@ -31,6 +33,7 @@ export interface BacktestParams {
   max_daily_trades: number
   max_daily_loss: number
   max_consecutive_losses: number
+  entry_confirm_minutes: number
 }
 
 export interface BacktestTrade {
@@ -53,6 +56,8 @@ export interface BacktestTrade {
   expiry_date: string | null
   dte: number
   delta: number | null
+  entry_reason: string | null
+  exit_detail: string | null
 }
 
 export interface BacktestDay {
@@ -116,6 +121,12 @@ export interface OptimizeResultEntry {
   avg_hold_minutes: number
   score: number
   exit_reasons: Record<string, number>
+  // Out-of-sample (walk-forward) metrics
+  oos_total_pnl: number | null
+  oos_total_trades: number | null
+  oos_win_rate: number | null
+  oos_profit_factor: number | null
+  oos_score: number | null
 }
 
 export interface OptimizeResponse {
@@ -123,6 +134,11 @@ export interface OptimizeResponse {
   elapsed_seconds: number
   target_metric: string
   results: OptimizeResultEntry[]
+  // Walk-forward date ranges
+  train_start: string | null
+  train_end: string | null
+  test_start: string | null
+  test_end: string | null
 }
 
 export async function runOptimization(params: OptimizeParams): Promise<OptimizeResponse> {

@@ -96,6 +96,7 @@ class Trade(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     trade_date = Column(Date, nullable=False)
+    ticker = Column(String(10), nullable=True, default="SPY")
     direction = Column(Enum(TradeDirection), nullable=False)
     option_symbol = Column(String(30), nullable=False)
     strike_price = Column(Float, nullable=False)
@@ -132,6 +133,25 @@ class Trade(Base):
     exit_price = Column(Float, nullable=True)
     exit_filled_at = Column(DateTime, nullable=True)
     exit_reason = Column(Enum(ExitReason), nullable=True)
+
+    # Per-trade exit params (from strategy config; NULL = use global settings)
+    param_stop_loss_percent = Column(Float, nullable=True)
+    param_profit_target_percent = Column(Float, nullable=True)
+    param_trailing_stop_percent = Column(Float, nullable=True)
+    param_max_hold_minutes = Column(Integer, nullable=True)
+
+    # ATR-based stop data
+    entry_atr_value = Column(Float, nullable=True)       # ATR of underlying at entry time
+    param_atr_stop_mult = Column(Float, nullable=True)   # ATR multiplier for stop distance
+
+    # Dynamic delta target used for this trade
+    param_delta_target = Column(Float, nullable=True)
+
+    # Strategy adapter metadata
+    entry_regime = Column(String(30), nullable=True)
+    entry_regime_confidence = Column(Float, nullable=True)
+    entry_vix = Column(Float, nullable=True)
+    adapter_applied = Column(Boolean, default=False)
 
     # PnL
     pnl_dollars = Column(Float, nullable=True)
@@ -227,3 +247,16 @@ class OptionChainContract(Base):
     volume = Column(Integer, nullable=True)
 
     snapshot = relationship("OptionChainSnapshot", back_populates="contracts")
+
+
+class FavoriteStrategy(Base):
+    __tablename__ = "favorite_strategies"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    ticker = Column(String(10), nullable=False, index=True)
+    strategy_name = Column(String(100), nullable=False)
+    direction = Column(String(10), nullable=True)
+    params = Column(Text, nullable=False)      # JSON
+    summary = Column(Text, nullable=True)       # JSON
+    notes = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)

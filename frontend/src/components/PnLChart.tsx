@@ -22,6 +22,7 @@ interface Props {
   data: PnLDataPoint[]
   totalPnl: number
   summaryData?: PnLSummaryData | null
+  isToday?: boolean
 }
 
 function formatDateShort(dateStr: string) {
@@ -29,7 +30,7 @@ function formatDateShort(dateStr: string) {
   return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
 }
 
-export function PnLChart({ period, data, totalPnl, summaryData }: Props) {
+export function PnLChart({ period, data, totalPnl, summaryData, isToday = true }: Props) {
   const cc = useChartColors()
 
   if (period !== 'daily' && summaryData) {
@@ -44,7 +45,7 @@ export function PnLChart({ period, data, totalPnl, summaryData }: Props) {
       <div className="bg-surface rounded-lg p-6">
         <h2 className="text-lg font-semibold mb-4">Cumulative P&L</h2>
         <div className="flex items-center justify-center h-64 text-muted">
-          No closed trades yet today
+          {isToday ? 'No closed trades yet today' : 'No closed trades on this date'}
         </div>
       </div>
     )

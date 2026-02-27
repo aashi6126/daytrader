@@ -56,6 +56,14 @@ class ORBSignalTask:
 
     def _get_spy_price(self) -> float | None:
         try:
+            # Try streaming cache first
+            from app.dependencies import get_streaming_service
+
+            snap = get_streaming_service().get_equity_quote("SPY")
+            if snap and not snap.is_stale and snap.last > 0:
+                return snap.last
+
+            # REST fallback
             from app.services.schwab_client import SchwabService
 
             schwab = SchwabService(self.app.state.schwab_client)
@@ -258,9 +266,12 @@ class ORBSignalTask:
             schwab = SchwabService(self.app.state.schwab_client)
             selector = OptionSelector(schwab)
             ws = get_ws_manager()
-            trade_mgr = TradeManager(schwab, selector, ws)
+            trade_mgr = TradeManager(schwab, selector, ws, app=self.app)
 
-            result = await trade_mgr.process_alert(db, db_alert, alert)
+            result = await trade_mgr.process_alert(
+                db, db_alert, alert,
+                strategy_params={"signal_type": "orb"},
+            )
             logger.info(f"ORB: trade result — {result.status}: {result.message}")
 
         except Exception as e:

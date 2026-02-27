@@ -52,8 +52,12 @@ class PaperSchwabClient:
                                 "bid": 1.50,
                                 "ask": 1.60,
                                 "delta": 0.45,
+                                "gamma": 0.04,
+                                "theta": -0.15,
+                                "volatility": 0.18,
                                 "openInterest": 5000,
                                 "totalVolume": 10000,
+                                "daysToExpiration": 0,
                             }
                         ],
                         "602.0": [
@@ -62,8 +66,12 @@ class PaperSchwabClient:
                                 "bid": 1.20,
                                 "ask": 1.35,
                                 "delta": 0.25,
+                                "gamma": 0.03,
+                                "theta": -0.10,
+                                "volatility": 0.20,
                                 "openInterest": 3000,
                                 "totalVolume": 8000,
+                                "daysToExpiration": 0,
                             }
                         ],
                     }
@@ -76,8 +84,12 @@ class PaperSchwabClient:
                                 "bid": 1.45,
                                 "ask": 1.55,
                                 "delta": -0.45,
+                                "gamma": 0.04,
+                                "theta": -0.14,
+                                "volatility": 0.18,
                                 "openInterest": 4000,
                                 "totalVolume": 9000,
+                                "daysToExpiration": 0,
                             }
                         ],
                     }

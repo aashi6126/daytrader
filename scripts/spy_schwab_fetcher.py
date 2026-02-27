@@ -158,7 +158,9 @@ def main():
 
         trading_days = df["Date"].nunique()
         date_range = f"{df['Date'].iloc[0]} to {df['Date'].iloc[-1]}"
-        csv_name = os.path.join(OUTPUT_DIR, f"SPY_{freq}min_6months.csv")
+        spy_dir = os.path.join(OUTPUT_DIR, "SPY")
+        os.makedirs(spy_dir, exist_ok=True)
+        csv_name = os.path.join(spy_dir, f"SPY_{freq}min_6months.csv")
 
         df.to_csv(csv_name, index=False)
 

@@ -12,6 +12,9 @@ interface Props {
 }
 
 const COL_COUNT = 15
+const SIGNAL_SOURCES = new Set(['tradingview', 'orb_auto', 'strategy_signal'])
+
+const isSignalTrade = (t: Trade) => SIGNAL_SOURCES.has(t.source ?? '')
 
 export function TradeTable({ trades, title, compact = false, onRetake }: Props) {
   const [expandedId, setExpandedId] = useState<number | null>(null)
@@ -22,13 +25,13 @@ export function TradeTable({ trades, title, compact = false, onRetake }: Props) 
 
   const afterSource =
     sourceFilter === 'signal'
-      ? trades.filter((t) => t.source === 'tradingview')
+      ? trades.filter(isSignalTrade)
       : sourceFilter === 'manual'
-        ? trades.filter((t) => t.source !== 'tradingview')
+        ? trades.filter((t) => !isSignalTrade(t))
         : trades
   const filtered = hideCancelled ? afterSource.filter((t) => t.status !== 'CANCELLED') : afterSource
   const cancelledCount = trades.length - trades.filter((t) => t.status !== 'CANCELLED').length
-  const signalCount = trades.filter((t) => t.source === 'tradingview').length
+  const signalCount = trades.filter(isSignalTrade).length
   const manualCount = trades.length - signalCount
 
   if (trades.length === 0) {
