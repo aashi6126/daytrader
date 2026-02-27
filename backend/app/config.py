@@ -120,7 +120,7 @@ class Settings(BaseSettings):
     # ORB Auto Strategy
     ACTIVE_STRATEGY: str = "orb_auto"  # "orb_auto" | "tradingview" | "disabled"
     # Allowed signal types for live trading (backtest can still test all)
-    ALLOWED_LIVE_SIGNAL_TYPES: List[str] = ["orb_direction", "confluence", "vwap_reclaim"]
+    ALLOWED_LIVE_SIGNAL_TYPES: List[str] = ["orb_direction"]
     ORB_MIN_RANGE: float = 0.30
     ORB_POLL_INTERVAL_SECONDS: int = 30
 
