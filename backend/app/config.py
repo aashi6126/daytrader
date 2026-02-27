@@ -42,7 +42,7 @@ class Settings(BaseSettings):
 
     # Entry limit strategy
     ENTRY_LIMIT_BELOW_PERCENT: float = 5.0
-    ENTRY_LIMIT_TIMEOUT_MINUTES: float = 3.0
+    ENTRY_LIMIT_TIMEOUT_MINUTES: float = 1.0  # Cancel after 60s — don't chase
 
     # Entry Filters
     MIN_OPTION_PRICE: float = 1.00  # Reject contracts with mid < this

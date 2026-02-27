@@ -1,4 +1,5 @@
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
+from unittest.mock import patch
 
 import pytest
 
@@ -213,3 +214,24 @@ def test_check_stop_loss_fill(db_session, mock_schwab, ws_manager):
     assert trade.exit_price == 1.78
     assert trade.exit_reason == ExitReason.STOP_LOSS
     assert trade.pnl_dollars == pytest.approx(-22.0, abs=0.01)
+
+
+@pytest.mark.asyncio
+async def test_entry_limit_timeout_cancels_trade(db_session, mock_schwab, ws_manager):
+    """Limit timeout should cancel the trade, not place a fallback order."""
+    trade, order_id = _make_trade(db_session, mock_schwab)
+    # Backdate created_at to simulate timeout
+    trade.created_at = datetime.utcnow() - timedelta(minutes=5)
+    db_session.commit()
+
+    schwab_svc = SchwabService(mock_schwab)
+    order_mgr = OrderManager(schwab_svc, ws_manager)
+
+    # Mock get_order_status to return WORKING (not auto-filled by dry_run)
+    with patch.object(schwab_svc, 'get_order_status', return_value={"status": "WORKING"}):
+        changed = await order_mgr.check_entry_fill(db_session, trade)
+
+    assert changed is True
+    assert trade.status == TradeStatus.CANCELLED
+    # Should NOT have placed a new order (no fallback)
+    assert trade.entry_is_fallback is False
