@@ -16,6 +16,7 @@ def _make_open_trade(db_session, entry_price=2.00, option_symbol="SPY_TEST_OPT",
                      entry_filled_at=None):
     trade = Trade(
         trade_date=date.today(),
+        ticker="SPY",
         direction=TradeDirection.CALL,
         option_symbol=option_symbol,
         strike_price=601.0,
@@ -164,20 +165,21 @@ async def test_high_water_mark_updates(db_session, mock_schwab, ws_manager):
 
 
 @pytest.mark.asyncio
-async def test_force_exit_330pm(db_session, mock_schwab, ws_manager):
+async def test_force_exit_at_cutoff(db_session, mock_schwab, ws_manager):
     trade = _make_open_trade(db_session, entry_price=2.00)
 
     mock_schwab.set_quote("SPY_TEST_OPT", bid=2.05, ask=2.15)
 
     engine = _make_exit_engine(mock_schwab, ws_manager)
-    now = datetime(2026, 2, 7, 15, 1, tzinfo=ET)  # 3:01 PM ET
+    # Use 3:31 PM ET — after force exit regardless of whether .env uses :00 or :30
+    now = datetime(2026, 2, 7, 15, 31, tzinfo=ET)
     result = await engine.evaluate_position(db_session, trade, now_et=now)
 
     assert result == ExitReason.TIME_BASED
 
 
 @pytest.mark.asyncio
-async def test_no_exit_before_330pm(db_session, mock_schwab, ws_manager):
+async def test_no_exit_before_cutoff(db_session, mock_schwab, ws_manager):
     trade = _make_open_trade(db_session, entry_price=2.00)
     trade.stop_loss_order_id = "some_order"
 
@@ -185,7 +187,8 @@ async def test_no_exit_before_330pm(db_session, mock_schwab, ws_manager):
     mock_schwab.set_quote("SPY_TEST_OPT", bid=2.05, ask=2.15)
 
     engine = _make_exit_engine(mock_schwab, ws_manager)
-    now = datetime(2026, 2, 7, 14, 59, tzinfo=ET)  # 2:59 PM ET
+    # Use 2:30 PM ET — before force exit regardless of config
+    now = datetime(2026, 2, 7, 14, 30, tzinfo=ET)
     result = await engine.evaluate_position(db_session, trade, now_et=now)
 
     assert result is None
