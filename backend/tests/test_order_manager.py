@@ -44,7 +44,7 @@ async def test_check_entry_fill_filled(db_session, mock_schwab, ws_manager):
     assert trade.entry_price == 1.55
     assert trade.status == TradeStatus.STOP_LOSS_PLACED
     assert trade.stop_loss_price is not None
-    assert trade.stop_loss_price == pytest.approx(1.55 * 0.60, abs=0.01)
+    assert trade.stop_loss_price == pytest.approx(1.55 * 0.75, abs=0.01)
 
 
 @pytest.mark.asyncio
@@ -79,7 +79,7 @@ async def test_stop_loss_placement(db_session, mock_schwab, ws_manager):
     order_mgr = OrderManager(SchwabService(mock_schwab), ws_manager)
     await order_mgr.check_entry_fill(db_session, trade)
 
-    assert trade.stop_loss_price == pytest.approx(1.20, abs=0.01)
+    assert trade.stop_loss_price == pytest.approx(1.50, abs=0.01)
     assert trade.stop_loss_order_id is not None
     assert trade.status == TradeStatus.STOP_LOSS_PLACED
 

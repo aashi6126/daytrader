@@ -33,7 +33,7 @@ class Settings(BaseSettings):
     MAX_DAILY_TRADES: int = 10
     MAX_DAILY_LOSS: float = 700.0
     DEFAULT_QUANTITY: int = 2
-    STOP_LOSS_PERCENT: float = 60.0
+    STOP_LOSS_PERCENT: float = 25.0  # Safety-net fallback only; ATR stops are primary
     TRADE_COOLDOWN_MINUTES: int = 5
     SIGNAL_DEBOUNCE_MINUTES: int = 2
     DEDUP_WINDOW_SECONDS: int = 30

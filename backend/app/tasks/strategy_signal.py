@@ -117,7 +117,7 @@ class StrategySignalTask:
             rsi_ob=float(p.get("rsi_ob", 70.0)),
             rsi_os=float(p.get("rsi_os", 30.0)),
             orb_minutes=int(p.get("orb_minutes", 15)),
-            atr_period=int(p.get("atr_period", 0)),
+            atr_period=int(p.get("atr_period", 14)),
             atr_stop_mult=float(p.get("atr_stop_mult", 2.0)),
             afternoon_enabled=True,
             quantity=settings.DEFAULT_QUANTITY,
