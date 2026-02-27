@@ -104,9 +104,9 @@ async def test_trailing_stop_trigger(db_session, mock_schwab, ws_manager):
     trade = _make_open_trade(db_session, entry_price=2.00)
     trade.highest_price_seen = 2.50  # Was up 25%
 
-    # Trail stop = 2.50 * 0.85 = 2.125
-    # Current mid = 2.10 < 2.125 -> trailing stop triggered
-    mock_schwab.set_quote("SPY_TEST_OPT", bid=2.05, ask=2.15)
+    # Trail stop = 2.50 * (1 - 20/100) = 2.00
+    # Current bid = 1.95 <= 2.00 -> trailing stop triggered
+    mock_schwab.set_quote("SPY_TEST_OPT", bid=1.95, ask=2.05)
 
     engine = _make_exit_engine(mock_schwab, ws_manager)
     now = datetime(2026, 2, 7, 14, 0, tzinfo=ET)
@@ -136,8 +136,8 @@ async def test_trailing_stop_not_triggered_above_trail(db_session, mock_schwab, 
     trade = _make_open_trade(db_session, entry_price=2.00)
     trade.highest_price_seen = 2.50  # Was up 25%
 
-    # Trail stop = 2.50 * 0.85 = 2.125
-    # Current mid = 2.20 > 2.125 -> no trigger
+    # Trail stop = 2.50 * (1 - 20/100) = 2.00
+    # Current bid = 2.15 > 2.00 -> no trigger
     mock_schwab.set_quote("SPY_TEST_OPT", bid=2.15, ask=2.25)
 
     engine = _make_exit_engine(mock_schwab, ws_manager)
@@ -159,7 +159,8 @@ async def test_high_water_mark_updates(db_session, mock_schwab, ws_manager):
     now = datetime(2026, 2, 7, 14, 0, tzinfo=ET)
     await engine.evaluate_position(db_session, trade, now_et=now)
 
-    assert trade.highest_price_seen == pytest.approx(2.10, abs=0.01)
+    # HWM uses BID (2.05), not mid (2.10)
+    assert trade.highest_price_seen == pytest.approx(2.05, abs=0.01)
 
 
 @pytest.mark.asyncio
@@ -218,8 +219,8 @@ async def test_max_hold_time_not_reached(db_session, mock_schwab, ws_manager):
     mock_schwab.set_quote("SPY_TEST_OPT", bid=2.05, ask=2.15)
 
     engine = _make_exit_engine(mock_schwab, ws_manager)
-    # 2 hours 59 min after fill (12:59 UTC)
-    now_utc = datetime(2026, 2, 7, 12, 59, 0, tzinfo=pytz.utc)
+    # 89 min after fill (11:29 UTC) — under 90 min max_hold
+    now_utc = datetime(2026, 2, 7, 11, 29, 0, tzinfo=pytz.utc)
     now_et = now_utc.astimezone(ET)
     result = await engine.evaluate_position(db_session, trade, now_et=now_et)
 

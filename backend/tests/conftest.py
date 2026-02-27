@@ -6,6 +6,11 @@ os.environ["SCHWAB_APP_KEY"] = "test-key"
 os.environ["SCHWAB_APP_SECRET"] = "test-secret-value"
 os.environ["SCHWAB_ACCOUNT_HASH"] = "test-hash"
 os.environ["DATABASE_URL"] = "sqlite://"
+os.environ["DRY_RUN"] = "false"
+
+from datetime import datetime
+from unittest.mock import MagicMock, patch
+from zoneinfo import ZoneInfo
 
 import pytest
 from fastapi.testclient import TestClient
@@ -74,6 +79,7 @@ def app(db_engine, mock_schwab):
     application.dependency_overrides[get_db] = get_test_db
     application.state.schwab_client = mock_schwab
     application.state.ws_manager = get_ws_manager()
+    application.state.ignore_trading_windows = True
 
     yield application
 
@@ -82,4 +88,17 @@ def app(db_engine, mock_schwab):
 
 @pytest.fixture
 def client(app):
-    return TestClient(app, raise_server_exceptions=False)
+    """TestClient with datetime and streaming mocked for market hours."""
+    market_time = datetime(2026, 3, 2, 10, 30, tzinfo=ZoneInfo("America/New_York"))
+
+    mock_streaming = MagicMock()
+    mock_snap = MagicMock()
+    mock_snap.is_stale = False
+    mock_snap.last = 18.0  # Normal VIX, below circuit breaker
+    mock_streaming.get_equity_quote.return_value = mock_snap
+
+    with patch("app.services.trade_manager.datetime") as mock_dt, \
+         patch("app.dependencies.get_streaming_service", return_value=mock_streaming):
+        mock_dt.now.return_value = market_time
+        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+        yield TestClient(app, raise_server_exceptions=False)

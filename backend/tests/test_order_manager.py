@@ -43,7 +43,8 @@ async def test_check_entry_fill_filled(db_session, mock_schwab, ws_manager):
 
     assert changed is True
     assert trade.entry_price == 1.55
-    assert trade.status == TradeStatus.STOP_LOSS_PLACED
+    # Entry confirmation delay: status is FILLED (stop placed later by ExitEngine)
+    assert trade.status == TradeStatus.FILLED
     assert trade.stop_loss_price is not None
     assert trade.stop_loss_price == pytest.approx(1.55 * 0.75, abs=0.01)
 
@@ -81,8 +82,8 @@ async def test_stop_loss_placement(db_session, mock_schwab, ws_manager):
     await order_mgr.check_entry_fill(db_session, trade)
 
     assert trade.stop_loss_price == pytest.approx(1.50, abs=0.01)
-    assert trade.stop_loss_order_id is not None
-    assert trade.status == TradeStatus.STOP_LOSS_PLACED
+    # Entry confirmation delay: stop price computed but Schwab order not placed yet
+    assert trade.status == TradeStatus.FILLED
 
 
 @pytest.mark.asyncio

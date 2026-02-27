@@ -71,7 +71,7 @@ async def receive_webhook(
         alert = TradingViewAlert(**payload)
     except ValidationError as e:
         logger.error(f"Validation error: {e.errors()}")
-        raise HTTPException(status_code=422, detail=e.errors())
+        raise HTTPException(status_code=422, detail=str(e))
 
     # Determine source
     source = alert.source if alert.source else "tradingview"
