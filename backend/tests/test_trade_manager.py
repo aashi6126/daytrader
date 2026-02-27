@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 from datetime import date, datetime
 from unittest.mock import MagicMock, patch
 from zoneinfo import ZoneInfo
@@ -12,6 +13,23 @@ from app.services.schwab_client import SchwabService
 from app.services.trade_manager import TradeManager
 from app.services.ws_manager import WebSocketManager
 from tests.mocks.mock_schwab import MockSchwabClient
+
+ET = ZoneInfo("America/New_York")
+
+
+@contextmanager
+def _mock_market_hours():
+    """Mock time to 11:00 AM ET (within market hours) and stub VIX + streaming."""
+    mock_now = datetime(2026, 3, 2, 11, 0, tzinfo=ET)
+    with patch("app.services.trade_manager.datetime") as mock_dt, \
+         patch("app.dependencies.get_streaming_service") as mock_stream:
+        mock_dt.now.return_value = mock_now
+        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+        mock_snap = MagicMock()
+        mock_snap.is_stale = False
+        mock_snap.last = 18.0  # low VIX
+        mock_stream.return_value.get_equity_quote.return_value = mock_snap
+        yield
 
 
 @pytest.fixture
@@ -78,7 +96,8 @@ async def test_process_alert_success(db_session, trade_manager_deps):
     db_session.add(db_alert)
     db_session.flush()
 
-    result = await trade_manager_deps.process_alert(db_session, db_alert, alert)
+    with _mock_market_hours():
+        result = await trade_manager_deps.process_alert(db_session, db_alert, alert)
 
     assert result.status == "accepted"
     assert result.trade_id is not None
@@ -120,7 +139,8 @@ async def test_process_alert_at_limit(db_session, trade_manager_deps):
     db_session.add(db_alert)
     db_session.flush()
 
-    result = await trade_manager_deps.process_alert(db_session, db_alert, alert)
+    with _mock_market_hours():
+        result = await trade_manager_deps.process_alert(db_session, db_alert, alert)
 
     assert result.status == "rejected"
     assert "limit" in result.message.lower()
@@ -141,7 +161,8 @@ async def test_process_alert_put_signal(db_session, trade_manager_deps):
     db_session.add(db_alert)
     db_session.flush()
 
-    result = await trade_manager_deps.process_alert(db_session, db_alert, alert)
+    with _mock_market_hours():
+        result = await trade_manager_deps.process_alert(db_session, db_alert, alert)
 
     assert result.status == "accepted"
     trade = db_session.query(Trade).filter(Trade.id == result.trade_id).first()
