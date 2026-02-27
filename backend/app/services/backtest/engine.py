@@ -4,6 +4,7 @@ Walks through historical bars, generates signals, simulates trade entry/exit
 using the same exit priority order as the live system (exit_engine.py).
 """
 
+import bisect
 import logging
 from dataclasses import dataclass, field
 from datetime import date, datetime, time
@@ -11,7 +12,11 @@ from typing import Literal, Optional
 
 from app.services.backtest.black_scholes import (
     estimate_option_price_at,
+    estimate_option_price_and_delta,
     select_strike_for_delta,
+)
+from app.services.backtest.spread_model import (
+    estimate_spread_pct,
 )
 from app.services.backtest.market_data import BarData, fetch_spy_bars, fetch_vix_daily, load_csv_bars
 
@@ -52,9 +57,10 @@ class BacktestParams:
     afternoon_enabled: bool = True
 
     # Entry
-    entry_limit_below_percent: float = 5.0
+    entry_limit_below_percent: float = 0.0  # removed: 5% free edge doesn't exist in live trading
     quantity: int = 2
     delta_target: float = 0.4
+    dynamic_delta: bool = False  # Use RegimeClassifier + VIX + time-of-day per signal
 
     # Exit
     stop_loss_percent: float = 16.0
@@ -69,25 +75,51 @@ class BacktestParams:
     breakeven_trigger_percent: float = 10.0
 
     # Confluence strategy params
-    min_confluence: int = 5       # minimum score (out of 6) to trigger signal
+    min_confluence: int = 5       # minimum score (out of 6, or 7 with pivots) to trigger signal
     vol_sma_period: int = 20      # volume moving average lookback
     vol_threshold: float = 1.5    # volume must be this multiple of average
+
+    # Pivot point S/R (7th confluence factor + optional entry filter)
+    pivot_enabled: bool = False           # enable pivot point calculations
+    pivot_proximity_pct: float = 0.3      # % threshold for "near a pivot level"
+    pivot_filter_enabled: bool = False    # block signals that fight S/R
+
+    # Bollinger Bands
+    bb_period: int = 20
+    bb_std_mult: float = 2.0
+
+    # MACD
+    macd_fast: int = 12
+    macd_slow: int = 26
+    macd_signal_period: int = 9
 
     # Data source
     data_source: str = "yfinance"  # "csv" or "yfinance"
 
     # ORB direction filter params
-    orb_body_min_pct: float = 0.0       # min ORB body/range ratio (0-1), 0=disabled
-    orb_vwap_filter: bool = False        # require ORB close on VWAP side
-    orb_gap_fade_filter: bool = False    # require gap to oppose ORB direction
+    orb_body_min_pct: float = 0.4        # min ORB body/range ratio (0-1), 0=disabled
+    orb_vwap_filter: bool = True         # require ORB close on VWAP side
+    orb_gap_fade_filter: bool = True     # require gap to oppose ORB direction
     orb_time_stop: time = field(default_factory=lambda: time(14, 0))
     orb_stop_mult: float = 1.0          # stop = N * ORB range below breakout
     orb_target_mult: float = 1.5        # target = N * ORB range above breakout
 
     # Limits
     max_daily_trades: int = 10
-    max_daily_loss: float = 500.0
+    max_daily_loss: float = 2000.0
     max_consecutive_losses: int = 3
+
+    # VIX filter (skip trades when VIX outside range; 0/100 = disabled)
+    vix_min: float = 0.0
+    vix_max: float = 100.0
+
+    # Slippage: model bid-ask spread costs on entry and exit
+    entry_slippage_percent: float = 1.0   # flat fallback when spread model disabled
+    exit_slippage_percent: float = 1.0    # flat fallback when spread model disabled
+    spread_model_enabled: bool = True     # dynamic spread from delta/time/VIX (overrides flat %)
+
+    # Entry confirmation: require N 1-minute bars to confirm direction (0 = immediate)
+    entry_confirm_minutes: int = 0
 
 
 @dataclass
@@ -127,6 +159,9 @@ class SimulatedTrade:
     expiry_date: Optional[date] = None
     dte: int = 0
     delta: Optional[float] = None
+
+    entry_reason: Optional[str] = None
+    exit_detail: Optional[str] = None
 
 
 @dataclass
@@ -241,6 +276,32 @@ def _compute_vwap(bars: list[BarData]) -> list[Optional[float]]:
 
 
 @dataclass
+class PivotLevels:
+    """Classic floor trader pivot points from prior day OHLC."""
+    pivot: float    # P = (H + L + C) / 3
+    r1: float       # R1 = 2*P - L
+    s1: float       # S1 = 2*P - H
+    r2: float       # R2 = P + (H - L)
+    s2: float       # S2 = P - (H - L)
+
+
+def compute_pivot_levels(
+    prev_high: float,
+    prev_low: float,
+    prev_close: float,
+) -> PivotLevels:
+    """Compute classic pivot points from prior day OHLC."""
+    p = (prev_high + prev_low + prev_close) / 3.0
+    return PivotLevels(
+        pivot=round(p, 2),
+        r1=round(2.0 * p - prev_low, 2),
+        s1=round(2.0 * p - prev_high, 2),
+        r2=round(p + (prev_high - prev_low), 2),
+        s2=round(p - (prev_high - prev_low), 2),
+    )
+
+
+@dataclass
 class Signal:
     timestamp: datetime
     direction: Literal["CALL", "PUT"]
@@ -248,6 +309,9 @@ class Signal:
     reason: str
     orb_range: Optional[float] = None
     orb_entry_level: Optional[float] = None
+    confluence_score: Optional[int] = None
+    confluence_max_score: Optional[int] = None
+    rel_vol: Optional[float] = None
 
 
 def _compute_bollinger(closes: list[float], period: int = 20, std_mult: float = 2.0):
@@ -327,6 +391,9 @@ def _generate_signals(
     bars: list[BarData],
     params: BacktestParams,
     prev_close: Optional[float] = None,
+    prev_high: Optional[float] = None,
+    prev_low: Optional[float] = None,
+    confirm_bars: Optional[list[BarData]] = None,
 ) -> list[Signal]:
     if len(bars) < max(params.ema_slow + 1, 26):
         return []
@@ -343,16 +410,21 @@ def _generate_signals(
         rsi = _compute_rsi(closes, rsi_period)
 
     # Bollinger Bands (for bb_squeeze strategy)
-    bb_upper, bb_lower, bb_mid = _compute_bollinger(closes, 20, 2.0)
+    bb_upper, bb_lower, bb_mid = _compute_bollinger(closes, params.bb_period, params.bb_std_mult)
 
     # MACD and Volume SMA (for confluence strategy)
     macd_line: list[Optional[float]] = [None] * len(bars)
-    macd_signal: list[Optional[float]] = [None] * len(bars)
+    macd_sig_line: list[Optional[float]] = [None] * len(bars)
     macd_hist: list[Optional[float]] = [None] * len(bars)
     vol_sma: list[Optional[float]] = [None] * len(bars)
     if params.signal_type == "confluence":
-        macd_line, macd_signal, macd_hist = _compute_macd(closes, 12, 26, 9)
+        macd_line, macd_sig_line, macd_hist = _compute_macd(closes, params.macd_fast, params.macd_slow, params.macd_signal_period)
         vol_sma = _compute_volume_sma(bars, params.vol_sma_period)
+
+    # Pivot points (from prior day OHLC)
+    pivots: Optional[PivotLevels] = None
+    if params.pivot_enabled and prev_high is not None and prev_low is not None and prev_close is not None:
+        pivots = compute_pivot_levels(prev_high, prev_low, prev_close)
 
     # ORB: compute opening range from first N minutes
     orb_high: Optional[float] = None
@@ -400,6 +472,9 @@ def _generate_signals(
         reason = ""
         sig_orb_range: Optional[float] = None
         sig_orb_entry: Optional[float] = None
+        sig_confluence_score: Optional[int] = None
+        sig_confluence_max: Optional[int] = None
+        sig_rel_vol: Optional[float] = None
 
         if params.signal_type == "confluence":
             # ── Multi-indicator confluence scoring ──
@@ -445,14 +520,17 @@ def _generate_signals(
                     put_score += 1
                     put_factors.append("MACD")
 
-            # 5. Relative volume above threshold
+            # 5. Relative volume above threshold (confirms EMA trend direction)
             if vol_sma[i] is not None and vol_sma[i] > 0:
                 rel_vol = bar.volume / vol_sma[i]
                 if rel_vol >= params.vol_threshold:
-                    call_score += 1
-                    put_score += 1
-                    call_factors.append(f"Vol:{rel_vol:.1f}x")
-                    put_factors.append(f"Vol:{rel_vol:.1f}x")
+                    if ema_f[i] is not None and ema_s[i] is not None:
+                        if ema_f[i] > ema_s[i]:
+                            call_score += 1
+                            call_factors.append(f"Vol:{rel_vol:.1f}x")
+                        elif ema_f[i] < ema_s[i]:
+                            put_score += 1
+                            put_factors.append(f"Vol:{rel_vol:.1f}x")
 
             # 6. Price action: candle direction
             if bar.close > bar.open:
@@ -462,13 +540,49 @@ def _generate_signals(
                 put_score += 1
                 put_factors.append("Candle")
 
+            # 7. Pivot point S/R proximity
+            if pivots is not None:
+                proximity = params.pivot_proximity_pct / 100.0
+                price = bar.close
+                near_s1 = abs(price - pivots.s1) / pivots.s1 < proximity if pivots.s1 != 0 else False
+                near_s2 = abs(price - pivots.s2) / pivots.s2 < proximity if pivots.s2 != 0 else False
+                near_r1 = abs(price - pivots.r1) / pivots.r1 < proximity if pivots.r1 != 0 else False
+                near_r2 = abs(price - pivots.r2) / pivots.r2 < proximity if pivots.r2 != 0 else False
+                if near_s1 or near_s2:
+                    call_score += 1
+                    nearest = "S1" if abs(price - pivots.s1) < abs(price - pivots.s2) else "S2"
+                    call_factors.append(f"Pivot:{nearest}")
+                elif near_r1 or near_r2:
+                    put_score += 1
+                    nearest = "R1" if abs(price - pivots.r1) < abs(price - pivots.r2) else "R2"
+                    put_factors.append(f"Pivot:{nearest}")
+                elif price < pivots.pivot:
+                    call_score += 1
+                    call_factors.append("Pivot:<P")
+                elif price > pivots.pivot:
+                    put_score += 1
+                    put_factors.append("Pivot:>P")
+
             # Fire signal if score meets minimum confluence threshold
+            max_score = 7 if pivots is not None else 6
+
+            # Compute rel_vol for this bar (used for confidence sizing)
+            bar_rel_vol = None
+            if vol_sma[i] is not None and vol_sma[i] > 0:
+                bar_rel_vol = round(bar.volume / vol_sma[i], 2)
+
             if call_score >= params.min_confluence and call_score > put_score:
                 direction = "CALL"
-                reason = f"Confluence {call_score}/6: {', '.join(call_factors)}"
+                reason = f"Confluence {call_score}/{max_score}: {', '.join(call_factors)}"
+                sig_confluence_score = call_score
+                sig_confluence_max = max_score
+                sig_rel_vol = bar_rel_vol
             elif put_score >= params.min_confluence and put_score > call_score:
                 direction = "PUT"
-                reason = f"Confluence {put_score}/6: {', '.join(put_factors)}"
+                reason = f"Confluence {put_score}/{max_score}: {', '.join(put_factors)}"
+                sig_confluence_score = put_score
+                sig_confluence_max = max_score
+                sig_rel_vol = bar_rel_vol
 
         elif params.signal_type == "orb":
             # ORB: trade breakouts of opening range
@@ -599,6 +713,23 @@ def _generate_signals(
                 if direction == "PUT" and rsi[i] < params.rsi_os:
                     continue  # don't buy puts when oversold
 
+        # Pivot S/R filter: block signals that fight key levels
+        if direction and params.pivot_filter_enabled and pivots is not None:
+            proximity = params.pivot_proximity_pct / 100.0
+            price = bar.close
+            if direction == "CALL":
+                # Block CALL if price is near resistance (buying into ceiling)
+                near_r1 = abs(price - pivots.r1) / pivots.r1 < proximity if pivots.r1 != 0 else False
+                near_r2 = abs(price - pivots.r2) / pivots.r2 < proximity if pivots.r2 != 0 else False
+                if near_r1 or near_r2:
+                    continue
+            elif direction == "PUT":
+                # Block PUT if price is near support (selling into floor)
+                near_s1 = abs(price - pivots.s1) / pivots.s1 < proximity if pivots.s1 != 0 else False
+                near_s2 = abs(price - pivots.s2) / pivots.s2 < proximity if pivots.s2 != 0 else False
+                if near_s1 or near_s2:
+                    continue
+
         if direction:
             signals.append(Signal(
                 timestamp=bar.timestamp,
@@ -607,7 +738,28 @@ def _generate_signals(
                 reason=reason,
                 orb_range=sig_orb_range,
                 orb_entry_level=sig_orb_entry,
+                confluence_score=sig_confluence_score,
+                confluence_max_score=sig_confluence_max,
+                rel_vol=sig_rel_vol,
             ))
+
+    # Entry confirmation: require N 1-minute bars to confirm direction
+    if params.entry_confirm_minutes > 0 and confirm_bars:
+        confirmed: list[Signal] = []
+        for sig in signals:
+            future = [b for b in confirm_bars if b.timestamp > sig.timestamp]
+            if len(future) < params.entry_confirm_minutes:
+                continue
+            confirm_bar = future[params.entry_confirm_minutes - 1]
+            if sig.direction == "CALL" and confirm_bar.close > confirm_bar.open:
+                sig.timestamp = confirm_bar.timestamp
+                sig.ticker_price = confirm_bar.close
+                confirmed.append(sig)
+            elif sig.direction == "PUT" and confirm_bar.close < confirm_bar.open:
+                sig.timestamp = confirm_bar.timestamp
+                sig.ticker_price = confirm_bar.close
+                confirmed.append(sig)
+        signals = confirmed
 
     return signals
 
@@ -625,10 +777,15 @@ def _close_trade(
     exit_time: datetime,
     exit_price: float,
     exit_reason: str,
+    exit_slippage_percent: float = 0.0,
+    exit_detail: str = "",
 ) -> None:
+    if exit_slippage_percent > 0:
+        exit_price = max(exit_price * (1 - exit_slippage_percent / 100), 0.01)
     trade.exit_time = exit_time
     trade.exit_price = exit_price
     trade.exit_reason = exit_reason
+    trade.exit_detail = exit_detail or None
     trade.hold_minutes = (exit_time - trade.entry_time).total_seconds() / 60
 
     remaining_qty = trade.quantity - trade.scaled_out_quantity
@@ -677,17 +834,33 @@ def _simulate_trade(
     if not use_orb_stops:
         if params.atr_period > 0 and atr_at_entry is not None and atr_at_entry > 0:
             atr_stop_offset = atr_at_entry * params.atr_stop_mult
-            approx_opt_atr = atr_stop_offset * 0.4  # rough delta
+            approx_opt_atr = atr_stop_offset * params.delta_target
             stop_price = max(trade.entry_price - approx_opt_atr, 0.01)
         else:
             stop_price = trade.entry_price * (1 - params.stop_loss_percent / 100)
 
     for bar in bars_after:
         mtc = _minutes_to_close(bar.timestamp)
-        opt_price = max(
-            estimate_option_price_at(bar.close, trade.strike, mtc, vix, trade.direction),
-            0.01,
-        )
+        # Combined B-S call: get both price and delta in one shot
+        opt_result = estimate_option_price_and_delta(bar.close, trade.strike, mtc, vix, trade.direction)
+        opt_price = max(opt_result.price, 0.01)
+
+        # Intrabar stop check: estimate option price at worst underlying level
+        if not use_orb_stops:
+            worst_underlying = bar.low if trade.direction == "CALL" else bar.high
+            opt_price_worst = max(
+                estimate_option_price_at(worst_underlying, trade.strike, mtc, vix, trade.direction),
+                0.01,
+            )
+        else:
+            opt_price_worst = opt_price
+
+        # Compute per-bar exit slippage (dynamic spread or flat)
+        if params.spread_model_enabled:
+            exit_spread = estimate_spread_pct(opt_result.delta, mtc, vix, opt_price, is_0dte=True)
+            bar_slippage = exit_spread / 2 * 100  # _close_trade expects a percentage
+        else:
+            bar_slippage = params.exit_slippage_percent
 
         if opt_price > trade.highest_price_seen:
             trade.highest_price_seen = opt_price
@@ -697,30 +870,37 @@ def _simulate_trade(
 
         # P1: Force exit
         if bar.timestamp.time() >= params.force_exit_time:
-            _close_trade(trade, bar.timestamp, opt_price, "TIME_BASED")
+            _close_trade(trade, bar.timestamp, opt_price, "TIME_BASED", bar_slippage,
+                         exit_detail=f"Force exit at {bar.timestamp.strftime('%H:%M')} (opt ${opt_price:.2f})")
             return
 
         # ORB time stop
         if use_orb_stops and bar.timestamp.time() >= params.orb_time_stop:
-            _close_trade(trade, bar.timestamp, opt_price, "ORB_TIME_STOP")
+            _close_trade(trade, bar.timestamp, opt_price, "ORB_TIME_STOP", bar_slippage,
+                         exit_detail=f"ORB time stop at {bar.timestamp.strftime('%H:%M')} (opt ${opt_price:.2f})")
             return
 
         # P2: Max hold
         if elapsed >= params.max_hold_minutes:
-            _close_trade(trade, bar.timestamp, opt_price, "MAX_HOLD_TIME")
+            _close_trade(trade, bar.timestamp, opt_price, "MAX_HOLD_TIME", bar_slippage,
+                         exit_detail=f"Held {elapsed:.0f}min (max {params.max_hold_minutes}min)")
             return
 
-        # P3: Stop loss
+        # P3: Stop loss (intrabar: check worst-case price within bar)
         if use_orb_stops:
             if trade.direction == "CALL" and bar.low <= spy_stop:
-                _close_trade(trade, bar.timestamp, opt_price, "STOP_LOSS")
+                _close_trade(trade, bar.timestamp, opt_price, "STOP_LOSS", bar_slippage,
+                             exit_detail=f"Underlying ${bar.low:.2f} hit ORB stop ${spy_stop:.2f}")
                 return
             elif trade.direction == "PUT" and bar.high >= spy_stop:
-                _close_trade(trade, bar.timestamp, opt_price, "STOP_LOSS")
+                _close_trade(trade, bar.timestamp, opt_price, "STOP_LOSS", bar_slippage,
+                             exit_detail=f"Underlying ${bar.high:.2f} hit ORB stop ${spy_stop:.2f}")
                 return
         else:
-            if opt_price <= stop_price:
-                _close_trade(trade, bar.timestamp, opt_price, "STOP_LOSS")
+            if opt_price_worst <= stop_price:
+                fill_price = opt_price_worst  # realistic fill at actual worst price, not ideal stop level
+                _close_trade(trade, bar.timestamp, fill_price, "STOP_LOSS", bar_slippage,
+                             exit_detail=f"Opt ${opt_price_worst:.2f} <= stop ${stop_price:.2f} (-{params.stop_loss_percent:.0f}%)")
                 return
 
         # Breakeven stop adjustment (non-ORB only)
@@ -736,10 +916,12 @@ def _simulate_trade(
         # P4: Profit target
         if use_orb_stops:
             if trade.direction == "CALL" and bar.high >= spy_target:
-                _close_trade(trade, bar.timestamp, opt_price, "PROFIT_TARGET")
+                _close_trade(trade, bar.timestamp, opt_price, "PROFIT_TARGET", bar_slippage,
+                             exit_detail=f"Underlying ${bar.high:.2f} hit ORB target ${spy_target:.2f}")
                 return
             elif trade.direction == "PUT" and bar.low <= spy_target:
-                _close_trade(trade, bar.timestamp, opt_price, "PROFIT_TARGET")
+                _close_trade(trade, bar.timestamp, opt_price, "PROFIT_TARGET", bar_slippage,
+                             exit_detail=f"Underlying ${bar.low:.2f} hit ORB target ${spy_target:.2f}")
                 return
         else:
             if gain_pct >= params.profit_target_percent:
@@ -748,7 +930,8 @@ def _simulate_trade(
                     trade.scaled_out_quantity = trade.quantity // 2
                     trade.scaled_out_price = opt_price
                 elif not trade.scaled_out:
-                    _close_trade(trade, bar.timestamp, opt_price, "PROFIT_TARGET")
+                    _close_trade(trade, bar.timestamp, opt_price, "PROFIT_TARGET", bar_slippage,
+                                 exit_detail=f"Gain {gain_pct:.1f}% >= {params.profit_target_percent:.0f}% (opt ${opt_price:.2f})")
                     return
 
         # P5: Trailing stop
@@ -760,18 +943,23 @@ def _simulate_trade(
             )
             trail_price = trade.highest_price_seen * (1 - trail_pct / 100)
             if opt_price <= trail_price:
-                _close_trade(trade, bar.timestamp, opt_price, "TRAILING_STOP")
+                _close_trade(trade, bar.timestamp, opt_price, "TRAILING_STOP", bar_slippage,
+                             exit_detail=f"Opt ${opt_price:.2f} <= trail ${trail_price:.2f} (peak ${trade.highest_price_seen:.2f}, {trail_pct:.0f}%)")
                 return
 
     # End of day — force close at last bar
     if trade.exit_time is None and bars_after:
         last = bars_after[-1]
         mtc = _minutes_to_close(last.timestamp)
-        last_price = max(
-            estimate_option_price_at(last.close, trade.strike, mtc, vix, trade.direction),
-            0.01,
-        )
-        _close_trade(trade, last.timestamp, last_price, "TIME_BASED")
+        eod_result = estimate_option_price_and_delta(last.close, trade.strike, mtc, vix, trade.direction)
+        last_price = max(eod_result.price, 0.01)
+        if params.spread_model_enabled:
+            exit_spread = estimate_spread_pct(eod_result.delta, mtc, vix, last_price, is_0dte=True)
+            eod_slippage = exit_spread / 2 * 100
+        else:
+            eod_slippage = params.exit_slippage_percent
+        _close_trade(trade, last.timestamp, last_price, "TIME_BASED", eod_slippage,
+                     exit_detail=f"EOD close (opt ${last_price:.2f})")
 
 
 # ── Main entry point ──────────────────────────────────────────────
@@ -793,16 +981,41 @@ def run_backtest(
             bars_by_day = fetch_spy_bars(params.start_date, params.end_date, params.bar_interval)
         vix_by_day = fetch_vix_daily(params.start_date, params.end_date)
 
+    # Fetch 1-minute bars for entry confirmation if needed
+    confirm_bars_by_day: Optional[dict] = None
+    if params.entry_confirm_minutes > 0:
+        if params.data_source == "csv":
+            confirm_bars_by_day = load_csv_bars(params.start_date, params.end_date, "1m")
+        else:
+            confirm_bars_by_day = fetch_spy_bars(params.start_date, params.end_date, "1m")
+
     result = BacktestResult(params=params)
     default_vix = 20.0
     prev_close: Optional[float] = None
+    prev_high: Optional[float] = None
+    prev_low: Optional[float] = None
 
     for trade_date in sorted(bars_by_day.keys()):
         day_bars = bars_by_day[trade_date]
         vix = vix_by_day.get(trade_date, default_vix)
+
+        # VIX regime filter: skip entire day if VIX outside [vix_min, vix_max]
+        if vix < params.vix_min or vix > params.vix_max:
+            if day_bars:
+                prev_close = day_bars[-1].close
+                prev_high = max(b.high for b in day_bars)
+                prev_low = min(b.low for b in day_bars)
+            result.days.append(DailyResult(trade_date=trade_date))
+            continue
+
         day_result = DailyResult(trade_date=trade_date)
 
-        signals = _generate_signals(day_bars, params, prev_close=prev_close)
+        confirm_day = confirm_bars_by_day.get(trade_date) if confirm_bars_by_day else None
+        signals = _generate_signals(
+            day_bars, params, prev_close=prev_close,
+            prev_high=prev_high, prev_low=prev_low,
+            confirm_bars=confirm_day,
+        )
 
         # Precompute ATR for the day if enabled
         day_atr: list[Optional[float]] = [None] * len(day_bars)
@@ -813,6 +1026,9 @@ def run_backtest(
         daily_pnl = 0.0
         consecutive_losses = 0
         last_exit_time: Optional[datetime] = None
+
+        # Precompute sorted timestamps for bisect-based entry bar lookup
+        bar_timestamps = [b.timestamp for b in day_bars]
 
         for signal in signals:
             # Limits
@@ -832,24 +1048,56 @@ def run_backtest(
             if mtc < 30:
                 continue
 
+            # Resolve delta target (dynamic or static)
+            effective_delta = params.delta_target
+            if params.dynamic_delta:
+                try:
+                    from app.services.delta_resolver import DeltaResolver
+
+                    signal_bars = [b for b in day_bars if b.timestamp <= signal.timestamp]
+                    if len(signal_bars) >= 21:
+                        import pandas as pd
+
+                        df = pd.DataFrame([
+                            {"open": b.open, "high": b.high, "low": b.low,
+                             "close": b.close, "volume": b.volume}
+                            for b in signal_bars
+                        ])
+                        resolver = DeltaResolver()
+                        effective_delta = resolver.resolve_for_backtest(
+                            signal_type=params.signal_type,
+                            df=df,
+                            vix=vix,
+                            signal_time=signal.timestamp.time(),
+                            atr=day_atr,
+                            hold_minutes=params.max_hold_minutes,
+                            underlying_price=signal.ticker_price,
+                        )
+                except Exception:
+                    pass  # fall back to params.delta_target
+
             strike, opt_data = select_strike_for_delta(
                 ticker_price=signal.ticker_price,
-                target_delta=params.delta_target,
+                target_delta=effective_delta,
                 minutes_to_expiry=mtc,
                 vix=vix,
                 option_type=signal.direction,
             )
 
-            entry_price = round(
-                max(opt_data.price * (1 - params.entry_limit_below_percent / 100), 0.01),
-                2,
-            )
+            # Entry price: apply limit discount, then add spread friction
+            limit_price = opt_data.price * (1 - params.entry_limit_below_percent / 100)
+            if params.spread_model_enabled:
+                entry_spread = estimate_spread_pct(
+                    opt_data.delta, mtc, vix, limit_price, is_0dte=True,
+                )
+                entry_price = round(max(limit_price * (1 + entry_spread / 2), 0.01), 2)
+            else:
+                entry_price = round(
+                    max(limit_price * (1 + params.entry_slippage_percent / 100), 0.01), 2,
+                )
 
-            entry_idx = next(
-                (i for i, b in enumerate(day_bars) if b.timestamp >= signal.timestamp),
-                None,
-            )
-            if entry_idx is None:
+            entry_idx = bisect.bisect_left(bar_timestamps, signal.timestamp)
+            if entry_idx >= len(day_bars):
                 continue
             bars_after = day_bars[entry_idx + 1:]
             if not bars_after:
@@ -868,6 +1116,7 @@ def run_backtest(
                 expiry_date=trade_date,
                 dte=0,
                 delta=round(opt_data.delta, 4),
+                entry_reason=signal.reason,
             )
 
             # Get ATR at entry point
@@ -892,6 +1141,8 @@ def run_backtest(
         day_result.pnl = round(daily_pnl, 2)
         if day_bars:
             prev_close = day_bars[-1].close
+            prev_high = max(b.high for b in day_bars)
+            prev_low = min(b.low for b in day_bars)
         result.days.append(day_result)
 
     _compute_summary(result)

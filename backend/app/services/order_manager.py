@@ -15,9 +15,10 @@ settings = Settings()
 
 
 class OrderManager:
-    def __init__(self, schwab_service: SchwabService, ws_manager: WebSocketManager):
+    def __init__(self, schwab_service: SchwabService, ws_manager: WebSocketManager, streaming_service=None):
         self.schwab = schwab_service
         self.ws_manager = ws_manager
+        self.streaming = streaming_service
 
     async def check_entry_fill(self, db: Session, trade: Trade) -> bool:
         if trade.status != TradeStatus.PENDING:
@@ -32,15 +33,32 @@ class OrderManager:
             trade.entry_filled_at = datetime.utcnow()
             trade.status = TradeStatus.FILLED
             trade.highest_price_seen = fill_price
+
+            # Compute stop price but DON'T place Schwab order yet (confirmation delay)
+            self._compute_stop_price(trade)
+
+            confirm_desc = f"delay {settings.ENTRY_CONFIRM_SECONDS}s"
+            if settings.ENTRY_CONFIRM_FAVORABLE_TICK:
+                confirm_desc += " + favorable tick"
             log_trade_event(
                 db, trade.id, TradeEventType.ENTRY_FILLED,
-                f"Entry filled at ${fill_price:.2f}",
-                details={"fill_price": fill_price, "order_id": trade.entry_order_id},
+                f"Entry filled at ${fill_price:.2f}, stop computed at ${trade.stop_loss_price:.2f} "
+                f"(confirm: {confirm_desc})",
+                details={
+                    "fill_price": fill_price, "order_id": trade.entry_order_id,
+                    "stop_loss_price": trade.stop_loss_price,
+                    "confirm_delay_seconds": settings.ENTRY_CONFIRM_SECONDS,
+                    "confirm_favorable_tick": settings.ENTRY_CONFIRM_FAVORABLE_TICK,
+                    "atr_value": trade.entry_atr_value,
+                    "atr_stop_mult": trade.param_atr_stop_mult,
+                },
             )
             db.commit()
 
-            logger.info(f"Trade #{trade.id} FILLED at {fill_price:.2f}")
-            await self._place_stop_loss(db, trade)
+            logger.info(
+                f"Trade #{trade.id} FILLED at {fill_price:.2f}, "
+                f"stop={trade.stop_loss_price:.2f} (confirmation delay {settings.ENTRY_CONFIRM_SECONDS}s)"
+            )
 
             await self.ws_manager.broadcast(
                 {
@@ -71,7 +89,7 @@ class OrderManager:
             )
             return True
 
-        # Entry limit timeout: cancel and fall back to current mid-price
+        # Entry limit timeout: cancel the trade — don't chase
         if (
             not trade.entry_is_fallback
             and trade.created_at
@@ -88,89 +106,66 @@ class OrderManager:
                     )
                     return False
 
+                trade.status = TradeStatus.CANCELLED
                 log_trade_event(
-                    db, trade.id, TradeEventType.ENTRY_LIMIT_TIMEOUT,
-                    f"Entry limit timed out after {settings.ENTRY_LIMIT_TIMEOUT_MINUTES} min, "
-                    f"cancelling order {old_order_id}",
+                    db, trade.id, TradeEventType.ENTRY_CANCELLED,
+                    f"Limit order timed out after {settings.ENTRY_LIMIT_TIMEOUT_MINUTES} min — "
+                    f"setup expired, not chasing (order {old_order_id})",
                     details={
                         "old_order_id": old_order_id,
                         "elapsed_seconds": round(elapsed, 1),
                         "original_limit_price": trade.alert_option_price,
                     },
                 )
-
-                current_mid = self._get_current_mid(trade.option_symbol)
-                if current_mid is None:
-                    logger.error(
-                        f"Trade #{trade.id}: cannot get mid-price for fallback, cancelling"
-                    )
-                    trade.status = TradeStatus.CANCELLED
-                    log_trade_event(
-                        db, trade.id, TradeEventType.ENTRY_CANCELLED,
-                        "Fallback failed: could not get current mid-price",
-                    )
-                    db.commit()
-                    return True
-
-                fallback_price = round(current_mid, 2)
-                order = SchwabService.build_option_buy_order(
-                    option_symbol=trade.option_symbol,
-                    quantity=trade.entry_quantity,
-                    limit_price=fallback_price,
-                )
-                try:
-                    new_order_id = self.schwab.place_order(order)
-                except Exception as e:
-                    logger.error(
-                        f"Trade #{trade.id}: fallback order failed: {e}"
-                    )
-                    trade.status = TradeStatus.CANCELLED
-                    log_trade_event(
-                        db, trade.id, TradeEventType.ENTRY_CANCELLED,
-                        f"Fallback order failed: {e}",
-                    )
-                    db.commit()
-                    return True
-
-                trade.entry_order_id = new_order_id
-                trade.entry_is_fallback = True
-                log_trade_event(
-                    db, trade.id, TradeEventType.ENTRY_ORDER_PLACED,
-                    f"Fallback: limit at current mid ${fallback_price:.2f}, order={new_order_id}",
-                    details={
-                        "order_id": new_order_id, "fallback_price": fallback_price,
-                        "is_fallback": True,
-                    },
-                )
                 db.commit()
 
                 logger.info(
-                    f"Trade #{trade.id}: limit timeout, fallback order at "
-                    f"${fallback_price:.2f} (order={new_order_id})"
+                    f"Trade #{trade.id}: limit timeout after "
+                    f"{elapsed:.0f}s — cancelled (not chasing)"
                 )
 
                 await self.ws_manager.broadcast({
-                    "event": "trade_entry_fallback",
+                    "event": "trade_cancelled",
                     "data": {
                         "trade_id": trade.id,
-                        "fallback_price": fallback_price,
+                        "reason": "LIMIT_TIMEOUT",
                     },
                 })
                 return True
 
         return False
 
+    def _compute_stop_price(self, trade: Trade) -> None:
+        """Compute stop_loss_price without placing Schwab order (for confirmation delay)."""
+        if trade.entry_atr_value and trade.param_atr_stop_mult:
+            delta_approx = trade.param_delta_target or 0.4
+            atr_offset = trade.entry_atr_value * trade.param_atr_stop_mult * delta_approx
+            trade.stop_loss_price = round(max(trade.entry_price - atr_offset, 0.01), 2)
+        else:
+            sl_pct = trade.param_stop_loss_percent or settings.STOP_LOSS_PERCENT
+            trade.stop_loss_price = round(trade.entry_price * (1 - sl_pct / 100), 2)
+
     async def _place_stop_loss(self, db: Session, trade: Trade) -> None:
-        stop_price = round(
-            trade.entry_price * (1 - settings.STOP_LOSS_PERCENT / 100), 2
-        )
-        trade.stop_loss_price = stop_price
+        """Place the actual Schwab STOP order (called after confirmation delay)."""
+        # Recompute stop if not already set
+        if not trade.stop_loss_price:
+            self._compute_stop_price(trade)
+
+        stop_price = trade.stop_loss_price
+        remaining_qty = trade.entry_quantity - (trade.scaled_out_quantity or 0)
 
         order = SchwabService.build_stop_loss_order(
             option_symbol=trade.option_symbol,
-            quantity=trade.entry_quantity,
+            quantity=remaining_qty,
             stop_price=stop_price,
         )
+
+        atr_info = ""
+        if trade.entry_atr_value and trade.param_atr_stop_mult:
+            atr_info = f", ATR-based (ATR={trade.entry_atr_value:.4f}x{trade.param_atr_stop_mult})"
+        else:
+            sl_pct = trade.param_stop_loss_percent or settings.STOP_LOSS_PERCENT
+            atr_info = f", {sl_pct}% SL"
 
         try:
             order_id = self.schwab.place_order(order)
@@ -178,12 +173,16 @@ class OrderManager:
             trade.status = TradeStatus.STOP_LOSS_PLACED
             log_trade_event(
                 db, trade.id, TradeEventType.STOP_LOSS_PLACED,
-                f"Stop-loss placed at ${stop_price:.2f} (order={order_id})",
-                details={"stop_price": stop_price, "order_id": order_id},
+                f"Stop-loss placed at ${stop_price:.2f}{atr_info} (order={order_id})",
+                details={
+                    "stop_price": stop_price, "order_id": order_id,
+                    "atr_value": trade.entry_atr_value,
+                    "atr_stop_mult": trade.param_atr_stop_mult,
+                },
             )
             db.commit()
             logger.info(
-                f"Trade #{trade.id} stop-loss at {stop_price:.2f} (order={order_id})"
+                f"Trade #{trade.id} stop-loss at {stop_price:.2f}{atr_info} (order={order_id})"
             )
         except Exception as e:
             logger.warning(
@@ -350,6 +349,7 @@ class OrderManager:
         trade: Trade,
         exit_reason: ExitReason,
         limit_price: float = None,
+        current_price: float = None,
     ) -> None:
         # Cancel existing stop-loss if managed by Schwab
         if trade.stop_loss_order_id:
@@ -374,6 +374,9 @@ class OrderManager:
             order_type=order_type,
             limit_price=limit_price,
         )
+        # For dry-run simulation: store current price so market orders fill realistically
+        if current_price and not limit_price:
+            order["_sim_price"] = str(current_price)
 
         order_id = self.schwab.place_order(order)
         trade.exit_order_id = order_id
@@ -504,6 +507,13 @@ class OrderManager:
         return False
 
     def _get_current_mid(self, option_symbol: str) -> Optional[float]:
+        # Try streaming cache first
+        if self.streaming:
+            snap = self.streaming.get_option_quote(option_symbol)
+            if snap and not snap.is_stale:
+                return snap.mid
+
+        # REST fallback
         try:
             quote = self.schwab.get_quote(option_symbol)
             quote_data = quote.get(option_symbol, {}).get("quote", {})
