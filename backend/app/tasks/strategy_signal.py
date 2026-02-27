@@ -193,10 +193,10 @@ class StrategySignalTask:
         bars.sort(key=lambda b: b.timestamp)
         return bars
 
-    def _get_strategy_params(self) -> dict:
+    def _get_strategy_params(self, signal=None) -> dict:
         """Extract per-trade exit params from this strategy's config."""
         p = self.params
-        return {
+        params = {
             "signal_type": self.signal_type,
             "param_stop_loss_percent": float(p.get("stop_loss_percent", 0)) or None,
             "param_profit_target_percent": float(p.get("profit_target_percent", 0)) or None,
@@ -205,8 +205,13 @@ class StrategySignalTask:
             "param_atr_stop_mult": float(p.get("atr_stop_mult", 0)) or None,
             "atr_period": int(p.get("atr_period", 0)) or None,
         }
+        if signal and signal.confluence_score is not None:
+            params["confluence_score"] = signal.confluence_score
+            params["confluence_max_score"] = signal.confluence_max_score
+            params["rel_vol"] = signal.rel_vol
+        return params
 
-    async def _fire_signal(self, direction: str, ticker_price: float):
+    async def _fire_signal(self, direction: str, ticker_price: float, signal=None):
         """Create a synthetic alert and route through TradeManager."""
         # Gate: only fire signals for allowed live signal types
         if self.signal_type not in settings.ALLOWED_LIVE_SIGNAL_TYPES:
@@ -219,7 +224,7 @@ class StrategySignalTask:
         action = "BUY_CALL" if direction == "CALL" else "BUY_PUT"
         trade_direction = TradeDirection.CALL if direction == "CALL" else TradeDirection.PUT
 
-        strategy_params = self._get_strategy_params()
+        strategy_params = self._get_strategy_params(signal)
         logger.info(
             f"StrategySignal: firing {action} for {self.ticker} "
             f"(signal_type={self.signal_type}, price=${ticker_price:.2f}, "
@@ -367,7 +372,7 @@ class StrategySignalTask:
                     f"bar {confirm_bar.timestamp.strftime('%H:%M')} green "
                     f"(O={confirm_bar.open:.2f} C={confirm_bar.close:.2f})"
                 )
-                await self._fire_signal(signal.direction, confirm_bar.close)
+                await self._fire_signal(signal.direction, confirm_bar.close, signal=signal)
                 del self._pending_confirm[sig_key]
             elif signal.direction == "PUT" and is_red:
                 logger.info(
@@ -375,7 +380,7 @@ class StrategySignalTask:
                     f"bar {confirm_bar.timestamp.strftime('%H:%M')} red "
                     f"(O={confirm_bar.open:.2f} C={confirm_bar.close:.2f})"
                 )
-                await self._fire_signal(signal.direction, confirm_bar.close)
+                await self._fire_signal(signal.direction, confirm_bar.close, signal=signal)
                 del self._pending_confirm[sig_key]
             else:
                 bar_color = "green" if is_green else ("red" if is_red else "doji")
@@ -429,7 +434,7 @@ class StrategySignalTask:
                 )
                 self._pending_confirm[sig_key] = signal
             else:
-                await self._fire_signal(signal.direction, signal.ticker_price)
+                await self._fire_signal(signal.direction, signal.ticker_price, signal=signal)
             # Only process one signal per poll to avoid rapid-fire entries
             break
 

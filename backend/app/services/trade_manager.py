@@ -579,6 +579,27 @@ class TradeManager:
         else:
             quantity = settings.DEFAULT_QUANTITY
 
+        # Confidence-based sizing: scale quantity for confluence signals
+        confluence_score = strategy_params.get("confluence_score") if strategy_params else None
+        if confluence_score is not None:
+            max_score = strategy_params.get("confluence_max_score", 6)
+            rel_vol = strategy_params.get("rel_vol") or 0
+            if (
+                confluence_score >= settings.CONFLUENCE_DOUBLE_MIN_SCORE
+                and rel_vol >= settings.CONFLUENCE_DOUBLE_MIN_REL_VOL
+            ):
+                quantity = quantity * 2
+                logger.info(
+                    f"Confidence sizing: DOUBLE (score={confluence_score}/{max_score}, "
+                    f"rel_vol={rel_vol:.1f}x) -> {quantity} contracts"
+                )
+            elif confluence_score <= settings.CONFLUENCE_HALF_MAX_SCORE:
+                quantity = max(1, quantity // 2)
+                logger.info(
+                    f"Confidence sizing: HALF (score={confluence_score}/{max_score}) "
+                    f"-> {quantity} contracts"
+                )
+
         # 4. Place entry order
         if self._use_market_orders:
             order = SchwabService.build_option_buy_market_order(

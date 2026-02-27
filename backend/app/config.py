@@ -57,6 +57,10 @@ class Settings(BaseSettings):
 
     # Position Sizing
     MAX_RISK_PER_TRADE: float = 300.0  # Max dollars at risk per trade
+    # Confidence-based sizing for confluence strategy
+    CONFLUENCE_DOUBLE_MIN_SCORE: int = 6  # Score needed (out of 6) for double size
+    CONFLUENCE_DOUBLE_MIN_REL_VOL: float = 2.0  # Relative volume needed for double size
+    CONFLUENCE_HALF_MAX_SCORE: int = 5  # Score at or below this = half size
 
     # Entry Confirmation Delay
     ENTRY_CONFIRM_SECONDS: int = 10  # Minimum seconds after fill before placing stop
