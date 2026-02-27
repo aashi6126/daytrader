@@ -24,6 +24,7 @@ backend/logs/
 .claude/
 .vscode/
 .idea/
+.worktrees/
 
 # Data files
 data/
